@@ -635,12 +635,16 @@ model.gradient_checkpointing_enable()
 
 # Mixed precision (fp16) is set in TrainingArguments
 
+# Timestamps / paths — keep HuggingFace Trainer output on DBFS, not under Git Repos (1GB limit).
+ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+HF_TRAINER_ROOT = "/dbfs/FileStore/address_correction_hf_trainer"
+_run_output_dir = os.path.join(HF_TRAINER_ROOT, f"product_corrector_using_hardnegs_{ts}")
 
 # -----------------------------
 # Training arguments
 # -----------------------------
 training_args = TrainingArguments(
-    output_dir="./product_corrector_using_hardnegs",
+    output_dir=_run_output_dir,
     evaluation_strategy="epoch",
     save_strategy="epoch",
     per_device_train_batch_size=16,   # adjust for your GPU
@@ -649,7 +653,7 @@ training_args = TrainingArguments(
     num_train_epochs=5,
     learning_rate=5e-5,
     weight_decay=0.01,
-    logging_dir="./logs",
+    logging_dir=os.path.join(_run_output_dir, "logs"),
     fp16=True,
     report_to="none",   # MLFlow logging handled manually
 )
@@ -658,7 +662,6 @@ training_args = TrainingArguments(
 # Set MLflow experiment
 # -----------------------------
 # mlflow.set_experiment("/Users/you@example.com/t5_experiments")
-ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 run_name = f"t5_product_corrector_using_hardnegs_{ts}"
 
 with mlflow.start_run(run_name=run_name) as run:

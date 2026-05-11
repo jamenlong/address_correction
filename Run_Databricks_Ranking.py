@@ -10,6 +10,8 @@
 # MAGIC - Optional: MLflow model URI for warm-start (`runs:/.../model`).
 # MAGIC
 # MAGIC **Repos:** keep this notebook in the **same folder** as `address_correction_ranking_pipeline.py` (repo root for this project).
+# MAGIC
+# MAGIC **Artifacts:** set the **`artifact_dir`** widget to **`/dbfs/FileStore/...`** so large outputs (HF `Trainer` checkpoints under `hf_trainer_checkpoints/`, tokenized data, `trained_model`) stay **outside** the Git-linked Repo tree (Databricks Repos ~1GB working-directory limit).
 
 # COMMAND ----------
 
@@ -31,7 +33,7 @@
 dbutils.widgets.dropdown("data_source", "delta_table", ["delta_table", "parquet"], "Data source")
 dbutils.widgets.text("source_table", "smarty.smarty_malformed_1000_training", "Delta table (if delta_table)")
 dbutils.widgets.text("source_parquet", "", "Parquet path /dbfs/... (if parquet)")
-dbutils.widgets.text("artifact_dir", "/dbfs/FileStore/address_correction_ranking", "Artifact / output base (DBFS)")
+dbutils.widgets.text("artifact_dir", "/dbfs/FileStore/address_correction_ranking", "DBFS base path; HF Trainer uses subfolder hf_trainer_checkpoints/")
 dbutils.widgets.text("hub_model_id", "t5-small", "Hub model id when not using MLflow checkpoint")
 dbutils.widgets.text("model_uri", "", "MLflow model URI, e.g. runs:/<run_id>/model (leave empty for Hub only)")
 dbutils.widgets.text("malform_filter", "legacy_one_comma", "malform_steps_filter: legacy_one_comma | none | min_steps | max_steps")

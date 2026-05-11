@@ -111,7 +111,9 @@ class PipelineConfig:
 
     # Training
     artifact_dir: str = "/tmp/address_correction_ranking"
-    output_dir: str = "./product_corrector_hard_negs"
+    # HuggingFace Trainer checkpoints (can be huge). Default None = under artifact_dir
+    # so Databricks Repos stays small — set artifact_dir to /dbfs/... on Databricks.
+    output_dir: Optional[str] = None
     num_train_epochs: int = 5
     per_device_train_batch_size: int = 8
     per_device_eval_batch_size: int = 8
@@ -140,6 +142,13 @@ class PipelineConfig:
 
     # Debug
     max_rows: Optional[int] = None
+
+
+def resolved_hf_trainer_output_dir(cfg: PipelineConfig) -> str:
+    """HF Trainer `output_dir` — never default to cwd inside a Databricks Repo."""
+    if cfg.output_dir:
+        return cfg.output_dir
+    return str(Path(cfg.artifact_dir) / "hf_trainer_checkpoints")
 
 
 @dataclass
@@ -525,8 +534,11 @@ def train_ranking_model(
     model = AutoModelForSeq2SeqLM.from_pretrained(model_dir)
     model.gradient_checkpointing_enable()
 
+    hf_out = resolved_hf_trainer_output_dir(cfg)
+    Path(hf_out).mkdir(parents=True, exist_ok=True)
+
     ta_kwargs = dict(
-        output_dir=cfg.output_dir,
+        output_dir=hf_out,
         save_strategy="epoch",
         per_device_train_batch_size=cfg.per_device_train_batch_size,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
@@ -534,7 +546,7 @@ def train_ranking_model(
         num_train_epochs=cfg.num_train_epochs,
         learning_rate=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
-        logging_dir=os.path.join(cfg.output_dir, "logs"),
+        logging_dir=os.path.join(hf_out, "logs"),
         fp16=cfg.fp16,
         report_to="none",
         seed=cfg.seed,
