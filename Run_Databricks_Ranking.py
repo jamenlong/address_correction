@@ -14,6 +14,11 @@
 # COMMAND ----------
 
 # MAGIC %pip install -q "datasets>=2.14" "accelerate>=0.26" "transformers>=4.36" "scikit-learn>=1.3" "mlflow>=2.10" "tqdm"
+<<<<<<< HEAD
+=======
+# MAGIC
+# MAGIC dbutils.library.restartPython()
+>>>>>>> 9ec63d26807dc488effc36d2a989bb516ce0c682
 
 # COMMAND ----------
 
@@ -24,7 +29,11 @@ dbutils.widgets.text("artifact_dir", "/dbfs/FileStore/address_correction_ranking
 dbutils.widgets.text("hub_model_id", "t5-small", "Hub model id when not using MLflow checkpoint")
 dbutils.widgets.text("model_uri", "", "MLflow model URI, e.g. runs:/<run_id>/model (leave empty for Hub only)")
 dbutils.widgets.text("malform_filter", "legacy_one_comma", "malform_steps_filter: legacy_one_comma | none | min_steps | max_steps")
+<<<<<<< HEAD
 dbutils.widgets.text("max_rows", "", "Optional max rows after load (empty = all)")
+=======
+dbutils.widgets.text("max_rows", "500", "Optional max rows after load (empty = all)")
+>>>>>>> 9ec63d26807dc488effc36d2a989bb516ce0c682
 dbutils.widgets.text("epochs", "2", "num_train_epochs")
 dbutils.widgets.text("eval_shortlist_k", "64", "Eval encoder shortlist size")
 dbutils.widgets.text("mlflow_experiment", "", "Optional MLflow experiment path (empty = skip MLflow logging)")
@@ -32,6 +41,7 @@ dbutils.widgets.text("predictions_table", "", "Optional Hive table for eval rows
 
 # COMMAND ----------
 
+<<<<<<< HEAD
 # -----------------------------------------------------------------------------
 # Why this cell exists (for new users)
 # -----------------------------------------------------------------------------
@@ -51,14 +61,24 @@ dbutils.widgets.text("predictions_table", "", "Optional Hive table for eval rows
 # print a hint — you may then need to sys.path.insert manually with your Repo path.
 # -----------------------------------------------------------------------------
 
+=======
+>>>>>>> 9ec63d26807dc488effc36d2a989bb516ce0c682
 import os
 import sys
 from pathlib import Path
 
+<<<<<<< HEAD
 try:
     nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
     if nb_path:
         # Parent of this notebook = directory that should contain the pipeline .py
+=======
+# Resolve repo folder (directory containing this notebook) and import the pipeline module
+try:
+    nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
+    if nb_path:
+        # Workspace path like /Repos/.../address_correction/Run_Databricks_Ranking
+>>>>>>> 9ec63d26807dc488effc36d2a989bb516ce0c682
         repo_root = str(Path(nb_path).parent)
         if repo_root not in sys.path:
             sys.path.insert(0, repo_root)
