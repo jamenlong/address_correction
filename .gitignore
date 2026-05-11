@@ -1,0 +1,44 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Jupyter / Databricks scratch
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ML checkpoints (keep out of Git — use MLflow, DBFS, or UC volumes)
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+optimizer.pt
+model.safetensors
+**/checkpoints/
+**/outputs/
+**/wandb/
+
+# Logs / local training dirs
+logs/
+runs/
+product_corrector*/
+
+# Env / secrets
+.env
+*.pem
