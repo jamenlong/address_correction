@@ -464,6 +464,50 @@ def tokenize_hard_negative_map_parallel(
     return concatenate_datasets(chunks) if chunks else Dataset.from_list([])
 
 
+def log_tokenization_preflight(
+    cfg: PipelineConfig,
+    train_rows: List[Dict[str, Any]],
+    test_rows: List[Dict[str, Any]],
+    train_rank_rows: List[Dict[str, Any]],
+    test_rank_rows: List[Dict[str, Any]],
+) -> None:
+    """Log sizes before ranking tokenization so you can verify max_rows / OOM expectations."""
+
+    def _approx_expanded_examples(rows: List[Dict[str, Any]]) -> int:
+        n = 0
+        for r in rows:
+            negs = r.get("hard_negatives") or []
+            n += 1 + len(negs)
+        return n
+
+    n_loaded = len(train_rows) + len(test_rows)
+    approx_tr = _approx_expanded_examples(train_rank_rows)
+    approx_ev = _approx_expanded_examples(test_rank_rows)
+    logger.info(
+        "=== Tokenization preflight ===\n"
+        "  Loaded rows (train+test after split): %d  (train_rows=%d test_rows=%d)\n"
+        "  train_rank_rows (with hard negatives): %d | test_rank_rows: %d\n"
+        "  cfg.max_rows: %r | test_size: %s | max_hard_negatives_per_row: %d\n"
+        "  use_spark_tokenization: %s\n"
+        "  Approx HF ranking examples (1 + len(hard_negatives) per row): train ~%d | eval ~%d\n"
+        "  Sanity: if train_rank_rows is far larger than max_rows*(1-test_size), "
+        "max_rows may not be applied to this run.\n"
+        "  tqdm 'Tokenize (chunk concat)' it/s ≈ source rows/s; a long stall after the bar "
+        "finishes is often concatenate_datasets() on the driver.",
+        n_loaded,
+        len(train_rows),
+        len(test_rows),
+        len(train_rank_rows),
+        len(test_rank_rows),
+        cfg.max_rows,
+        cfg.test_size,
+        cfg.max_hard_negatives_per_row,
+        cfg.use_spark_tokenization,
+        approx_tr,
+        approx_ev,
+    )
+
+
 def spark_tokenize_partitions(
     rows: List[Dict[str, Any]],
     tokenizer_dir: Path,
@@ -803,22 +847,20 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
     with open(hn_path, "wb") as f:
         pickle.dump({"train": train_rank_rows, "test": test_rows}, f)
 
+    test_rank_rows = [{**tr, "hard_negatives": []} for tr in test_rows]
+    log_tokenization_preflight(cfg, train_rows, test_rows, train_rank_rows, test_rank_rows)
+
     if cfg.use_spark_tokenization:
         chunk_paths = spark_tokenize_partitions(
             train_rank_rows, tokenizer_dir, cfg
         )
         train_ds = load_tokenized_chunks(chunk_paths)
-        # Test tokenization driver-only (smaller)
-        test_rank_rows = []
-        for tr in test_rows:
-            test_rank_rows.append({**tr, "hard_negatives": []})
         eval_chunks = spark_tokenize_partitions(test_rank_rows, tokenizer_dir, cfg)
         eval_ds = load_tokenized_chunks(eval_chunks)
     else:
         train_ds = tokenize_hard_negative_map_parallel(
             train_rank_rows, tokenizer_dir, cfg
         )
-        test_rank_rows = [{**tr, "hard_negatives": []} for tr in test_rows]
         eval_ds = tokenize_hard_negative_map_parallel(
             test_rank_rows, tokenizer_dir, cfg
         )

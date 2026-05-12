@@ -21,7 +21,7 @@
 # mlflow-skinny<3; TensorFlow/tensorboard want protobuf<5). Use the runtime's MLflow.
 #
 # If pip still warns about transitive deps, the next cell restarts Python so imports see the new wheels.
-%pip install -q "datasets>=2.14" "accelerate>=0.26" "transformers>=4.36" "scikit-learn>=1.3" "tqdm"
+# MAGIC %pip install -q "datasets>=2.14" "accelerate>=0.26" "transformers>=4.36" "scikit-learn>=1.3" "tqdm"
 
 # COMMAND ----------
 
@@ -173,6 +173,33 @@ else:
     )
 
 print("Config:", cfg)
+
+# COMMAND ----------
+
+# Pre-tokenization scale hints (exact row counts appear in driver logs as
+# "=== Tokenization preflight ===" from address_correction_ranking_pipeline.run_pipeline).
+print("\n--- Tokenization / driver memory (before run_pipeline) ---")
+print(f"  max_rows: {cfg.max_rows!r}")
+if cfg.max_rows is not None:
+    m = int(cfg.max_rows)
+    approx_train_src = max(0, int(m * (1 - float(cfg.test_size))))
+    print(
+        f"  Upper bound on loaded rows: {m}; rough train split rows ~{approx_train_src} "
+        f"(1 - test_size={cfg.test_size}) before hard-negative mining."
+    )
+else:
+    print(
+        "  max_rows is None: full table/parquet is loaded; tokenization cost scales with "
+        "source size — use max_rows for smoke tests."
+    )
+print(f"  max_hard_negatives_per_row: {cfg.max_hard_negatives_per_row}")
+print(f"  use_spark_tokenization: {cfg.use_spark_tokenization}")
+print(f"  tokenize_num_proc: {cfg.tokenize_num_proc!r}")
+print(
+    "  Ranking examples per source row ≈ 1 + len(hard_negatives); worst case grows with "
+    "neighbors/noisy candidates. tqdm 'Tokenize (chunk concat)' shows source rows/s; a long "
+    "pause after the bar completes is often concatenate_datasets() on the driver."
+)
 
 # COMMAND ----------
 
