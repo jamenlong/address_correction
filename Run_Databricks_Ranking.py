@@ -128,7 +128,11 @@ except Exception as e:
     print(f"Could not resolve notebook path ({e}); using cwd only.")
     sys.path.insert(0, os.getcwd())
 
-from address_correction_ranking_pipeline import PipelineConfig, run_pipeline
+from address_correction_ranking_pipeline import (
+    PipelineConfig,
+    eval_examples_as_flat_records,
+    run_pipeline,
+)
 
 # COMMAND ----------
 
@@ -214,11 +218,14 @@ print("Eval accuracy (shortlist):", result.eval_accuracy)
 
 # MAGIC %md
 # MAGIC ### Optional: inspect a few eval rows
-# MAGIC Run the cell below after a successful run.
+# MAGIC Run the cell below after a successful run. Rows are flattened for ``display()`` (nested ``scores`` / ``shortlist`` would otherwise break Spark schema inference).
 
 # COMMAND ----------
 
-display(result.eval_examples[:20])
+# Raw eval rows have nested "scores" (map) and "shortlist" (array); Databricks
+# display() -> createDataFrame cannot infer types. eval_examples_as_flat_records
+# also coerces null/NaN to empty strings and strict bools so schema inference is stable.
+display(eval_examples_as_flat_records(result.eval_examples, limit=20))
 
 # COMMAND ----------
 

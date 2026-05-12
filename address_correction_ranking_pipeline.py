@@ -743,6 +743,59 @@ def evaluate_closed_set_ranking(
     return results, acc
 
 
+def _eval_display_str(v: Any) -> str:
+    """Non-null string for Spark ``createDataFrame`` / Databricks ``display`` inference."""
+    if v is None:
+        return ""
+    if isinstance(v, float) and v != v:  # NaN
+        return ""
+    return str(v)
+
+
+def eval_examples_as_flat_records(
+    eval_examples: List[Dict[str, Any]],
+    limit: Optional[int] = 20,
+) -> List[Dict[str, Any]]:
+    """Scalar columns only so Databricks ``display(list_of_dicts)`` can infer a Spark schema.
+
+    Raw eval rows include ``scores`` (dict) and ``shortlist`` (list), which trigger
+    ``[CANNOT_DETERMINE_TYPE]`` when ``display`` wraps them in ``createDataFrame``.
+
+    String columns are never Python ``None`` (only empty ``str``), and ``is_correct`` is
+    always ``True`` or ``False``, so nullable/mixed-type inference issues are avoided.
+    """
+    rows = eval_examples if limit is None else eval_examples[: int(limit)]
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        pred = r.get("predicted")
+        ic = r.get("is_correct")
+        try:
+            is_correct = bool(ic)
+        except (TypeError, ValueError):
+            is_correct = False
+        scores = r.get("scores")
+        if not isinstance(scores, dict):
+            scores = {}
+        shortlist = r.get("shortlist")
+        if not isinstance(shortlist, list):
+            shortlist = []
+        out.append(
+            {
+                "noisy": _eval_display_str(r.get("noisy")),
+                "true": _eval_display_str(r.get("true")),
+                "predicted": _eval_display_str(pred),
+                "is_correct": is_correct,
+                "scores_json": json.dumps(
+                    scores, ensure_ascii=False, default=str, sort_keys=False
+                ),
+                "shortlist_json": json.dumps(
+                    shortlist, ensure_ascii=False, default=str
+                ),
+            }
+        )
+    return out
+
+
 def top_k_accuracy_from_results(results: List[Dict[str, Any]], k: int = 3) -> float:
     """Uses per-row 'scores' dict: true is correct if in first k candidates with score 'yes' in shortlist order."""
     if not results:
