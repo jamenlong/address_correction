@@ -1390,10 +1390,6 @@ def create_combination_lists(function_list, n, perm_or_comb = "combinations", ve
 
 # COMMAND ----------
 
-
-
-# COMMAND ----------
-
 # Create test datframe to serve as basis for new table of malformed addresses which will be appended with training data.
 
 from pyspark.sql.functions import col
@@ -1532,4 +1528,5 @@ display(malformed_sdf)
 
 
 # COMMAND ----------
+
 

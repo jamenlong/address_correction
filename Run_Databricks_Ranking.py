@@ -21,7 +21,7 @@
 # mlflow-skinny<3; TensorFlow/tensorboard want protobuf<5). Use the runtime's MLflow.
 #
 # If pip still warns about transitive deps, the next cell restarts Python so imports see the new wheels.
-# MAGIC %pip install -q "datasets>=2.14" "accelerate>=0.26" "transformers>=4.36" "scikit-learn>=1.3" "tqdm"
+%pip install -q "datasets>=2.14" "accelerate>=0.26" "transformers>=4.36" "scikit-learn>=1.3" "tqdm"
 
 # COMMAND ----------
 
@@ -41,7 +41,7 @@ dbutils.widgets.text("artifact_dir", "/dbfs/FileStore/address_correction_ranking
 dbutils.widgets.text("hub_model_id", "t5-small", "Hub model id when not using MLflow checkpoint")
 dbutils.widgets.text("model_uri", "", "MLflow model URI, e.g. runs:/<run_id>/model (leave empty for Hub only)")
 dbutils.widgets.text("malform_filter", "legacy_one_comma", "malform_steps_filter: legacy_one_comma | none | min_steps | max_steps")
-dbutils.widgets.text("max_rows", "", "Optional max rows after load (empty = all)")
+dbutils.widgets.text("max_rows", "500", "Optional max rows after load (empty = all)")
 dbutils.widgets.text("epochs", "2", "num_train_epochs")
 dbutils.widgets.text("eval_shortlist_k", "64", "Eval encoder shortlist size")
 dbutils.widgets.text("mlflow_experiment", "", "Optional MLflow experiment path (empty = skip MLflow logging)")
@@ -192,3 +192,7 @@ print("Eval accuracy (shortlist):", result.eval_accuracy)
 # COMMAND ----------
 
 display(result.eval_examples[:20])
+
+# COMMAND ----------
+
+

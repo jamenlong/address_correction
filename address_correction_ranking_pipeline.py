@@ -97,7 +97,7 @@ class PipelineConfig:
     # Hard-negative mining
     max_neighbors: int = 10
     max_noisy_per_neighbor: int = 5
-    max_hard_negatives_per_row: int = 20
+    max_hard_negatives_per_row: int = 15
     catalog_encode_batch_size: int = 128
 
     # Train / eval split (row-level, before expanding yes/no examples)
