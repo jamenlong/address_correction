@@ -182,6 +182,17 @@ print("Done.")
 print("Artifacts:", result.artifact_dir)
 print("Trained model dir:", result.model_dir)
 print("Eval accuracy (shortlist):", result.eval_accuracy)
+print(
+    "Malformation breakdown JSON:",
+    result.artifact_dir / "eval_accuracy_by_malform_steps.json",
+)
+try:
+    import pandas as pd
+
+    display(pd.DataFrame(result.eval_accuracy_by_malform_steps))
+except Exception:
+    for row in result.eval_accuracy_by_malform_steps:
+        print(row)
 
 # COMMAND ----------
 

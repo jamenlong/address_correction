@@ -9,7 +9,8 @@ This module replaces the fragile patterns in
 - Tokenization that never mixes MLflow tokenizer with a fresh Hub tokenizer on
   workers; workers load only from `save_pretrained` artifacts.
 - Evaluation that matches the training task and avoids full-catalog generation
-  unless explicitly requested (shortlist via encoder similarity).
+  unless explicitly requested (shortlist via encoder similarity), plus
+  **accuracy by `malformed_first_line_malform_steps`** (see `eval_accuracy_by_malform_steps.json`).
 - Configurable SQL (including the legacy single-comma malform-steps filter).
 - Optional Spark/Delta I/O; optional MLflow logging.
 
@@ -127,6 +128,8 @@ class PipelineConfig:
     # Evaluation: shortlist size for scoring (encoder cosine on catalog)
     eval_shortlist_k: int = 64
     eval_max_rows: Optional[int] = None
+    # Per-row breakdown: how many "yes" candidates count as hit for malform-step reports
+    eval_topk_for_breakdown: int = 3
 
     # Optional MLflow
     mlflow_experiment_name: Optional[str] = None
@@ -161,6 +164,7 @@ class PipelineResult:
     train_metrics: Dict[str, Any]
     eval_examples: List[Dict[str, Any]]
     eval_accuracy: float
+    eval_accuracy_by_malform_steps: List[Dict[str, Any]] = field(default_factory=list)
     mlflow_run_id: Optional[str] = None
 
 
@@ -637,6 +641,60 @@ def shortlist_catalog_indices(
     return idx.detach().cpu().tolist()
 
 
+def _normalize_malform_steps_label(raw: Any) -> str:
+    if raw is None:
+        return "(missing)"
+    s = str(raw).strip()
+    if not s or s.lower() == "nan":
+        return "(empty)"
+    return s
+
+
+def _row_topk_yes_hit(r: Dict[str, Any], k: int) -> bool:
+    yes_list = [c for c, v in r["scores"].items() if v == "yes"]
+    ordered = [c for c in r["shortlist"] if c in yes_list]
+    return r["true"] in ordered[:k]
+
+
+def summarize_accuracy_by_malform_steps(
+    eval_rows: List[Dict[str, Any]],
+    *,
+    malform_steps_key: str,
+    k_top: int = 3,
+) -> List[Dict[str, Any]]:
+    """Aggregate first-yes accuracy and top-k yes hit rate by malform-steps label."""
+    from collections import defaultdict
+
+    n_by: Dict[str, int] = defaultdict(int)
+    first_yes_by: Dict[str, int] = defaultdict(int)
+    topk_by: Dict[str, int] = defaultdict(int)
+
+    for r in eval_rows:
+        label = _normalize_malform_steps_label(r.get(malform_steps_key))
+        n_by[label] += 1
+        if r.get("is_correct"):
+            first_yes_by[label] += 1
+        if _row_topk_yes_hit(r, k_top):
+            topk_by[label] += 1
+
+    out: List[Dict[str, Any]] = []
+    for label in sorted(n_by.keys(), key=lambda x: (-n_by[x], x)):
+        n = n_by[label]
+        fy = first_yes_by[label]
+        tk = topk_by[label]
+        row_dict: Dict[str, Any] = {
+            malform_steps_key: label,
+            "n_rows": n,
+            "n_correct_first_yes": fy,
+            "accuracy_first_yes": round(fy / n, 6) if n else 0.0,
+            "n_correct_topk_yes": tk,
+            "accuracy_topk_yes": round(tk / n, 6) if n else 0.0,
+            "topk": k_top,
+        }
+        out.append(row_dict)
+    return out
+
+
 def evaluate_closed_set_ranking(
     model: torch.nn.Module,
     tokenizer: Any,
@@ -685,16 +743,17 @@ def evaluate_closed_set_ranking(
         if is_correct:
             correct += 1
         n += 1
-        results.append(
-            {
-                "noisy": noisy,
-                "true": true_c,
-                "predicted": predicted,
-                "is_correct": is_correct,
-                "scores": scores,
-                "shortlist": candidates,
-            }
-        )
+        steps_key = cfg.columns["steps"]
+        rec: Dict[str, Any] = {
+            "noisy": noisy,
+            "true": true_c,
+            "predicted": predicted,
+            "is_correct": is_correct,
+            "scores": scores,
+            "shortlist": candidates,
+        }
+        rec[steps_key] = _normalize_malform_steps_label(row.get(steps_key))
+        results.append(rec)
     acc = correct / n if n else 0.0
     return results, acc
 
@@ -862,10 +921,25 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
         cfg,
         device,
     )
-    topk = top_k_accuracy_from_results(eval_results, k=3)
+    topk = top_k_accuracy_from_results(
+        eval_results, k=cfg.eval_topk_for_breakdown
+    )
+    by_malform = summarize_accuracy_by_malform_steps(
+        eval_results,
+        malform_steps_key=cfg.columns["steps"],
+        k_top=cfg.eval_topk_for_breakdown,
+    )
+    malform_report_path = art / "eval_accuracy_by_malform_steps.json"
+    with open(malform_report_path, "w", encoding="utf-8") as f:
+        json.dump(by_malform, f, indent=2)
 
     logger.info("Eval accuracy (shortlist argmax yes): %.4f", acc)
-    logger.info("Top-3 yes accuracy: %.4f", topk)
+    logger.info("Top-%s yes accuracy: %.4f", cfg.eval_topk_for_breakdown, topk)
+    logger.info(
+        "Wrote malformation breakdown (%d groups) to %s",
+        len(by_malform),
+        malform_report_path,
+    )
 
     mlflow_run_id = None
     if cfg.mlflow_experiment_name:
@@ -880,7 +954,14 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
                     "hub_model_id": cfg.hub_model_id,
                 }
             )
-            mlflow.log_metrics({**{f"eval_{k}": v for k, v in eval_metrics.items()}, "shortlist_acc": acc, "top3_yes": topk})
+            mlflow.log_metrics(
+                {
+                    **{f"eval_{k}": v for k, v in eval_metrics.items()},
+                    "shortlist_acc": acc,
+                    f"top{cfg.eval_topk_for_breakdown}_yes": topk,
+                }
+            )
+            mlflow.log_artifact(str(malform_report_path))
             if cfg.mlflow_registered_model_name:
                 from transformers import pipeline as hf_pipeline
 
@@ -902,6 +983,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
 
             spark = SparkSession.builder.getOrCreate()
             out_rows = []
+            steps_col = cfg.columns["steps"]
             for r in eval_results:
                 out_rows.append(
                     (
@@ -911,11 +993,15 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
                         r["is_correct"],
                         json.dumps(r["scores"]),
                         jaro_winkler(r["true"], r["predicted"] or ""),
+                        r.get(steps_col, "(missing)"),
                     )
                 )
             sdf = spark.createDataFrame(
                 out_rows,
-                schema="noisy STRING, true_canonical STRING, predicted STRING, is_correct BOOLEAN, scores_json STRING, jw_score DOUBLE",
+                schema=(
+                    "noisy STRING, true_canonical STRING, predicted STRING, is_correct BOOLEAN, "
+                    "scores_json STRING, jw_score DOUBLE, malformed_first_line_malform_steps STRING"
+                ),
             )
             sdf.write.mode("overwrite").saveAsTable(cfg.predictions_table)
         except Exception as e:
@@ -930,6 +1016,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
         train_metrics=train_metrics,
         eval_examples=eval_results,
         eval_accuracy=acc,
+        eval_accuracy_by_malform_steps=by_malform,
         mlflow_run_id=mlflow_run_id,
     )
 
