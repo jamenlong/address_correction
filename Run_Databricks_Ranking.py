@@ -21,7 +21,7 @@
 # mlflow-skinny<3; TensorFlow/tensorboard want protobuf<5). Use the runtime's MLflow.
 #
 # If pip still warns about transitive deps, the next cell restarts Python so imports see the new wheels.
-%pip install -q "datasets>=2.14" "accelerate>=0.26" "transformers>=4.36" "scikit-learn>=1.3" "tqdm"
+# MAGIC %pip install -q "datasets>=2.14" "accelerate>=0.26" "transformers>=4.36" "scikit-learn>=1.3" "tqdm"
 
 # COMMAND ----------
 
@@ -56,31 +56,74 @@ dbutils.widgets.text("predictions_table", "", "Optional Hive table for eval rows
 # necessarily your Git repo folder. Python only imports modules that live on
 # sys.path (or the current working directory in some cases).
 #
-# This cell does three things:
-#   1. Ask Databricks for this notebook's workspace path (e.g. under Repos).
-#   2. Treat the *folder containing this notebook file* as the "repo root"
-#      and add it to sys.path so `import address_correction_ranking_pipeline`
-#      finds address_correction_ranking_pipeline.py sitting next to this file.
-#   3. os.chdir(repo_root) so any relative paths in the pipeline behave as if
-#      you ran from that folder.
+# `dbutils...notebookPath()` often returns a *workspace* path such as
+#   `/Users/you@domain.com/repo_name/NotebookName`
+# That path is not always a real directory on the driver, so `os.chdir` can
+# fail with ENOENT. We map it to the driver path Databricks uses, e.g.
+#   `/Workspace/Users/you@domain.com/repo_name`
+# and the same idea for `/Repos/...` -> `/Workspace/Repos/...`.
 #
-# If step 1 fails (rare API/context issues), we fall back to os.getcwd() and
-# print a hint — you may then need to sys.path.insert manually with your Repo path.
+# We add the first existing candidate to sys.path and chdir only if that
+# directory exists. If nothing matches, fall back to os.getcwd() and you may
+# need to set REPO_ROOT in a widget or sys.path.insert manually.
 # -----------------------------------------------------------------------------
 
 import os
 import sys
 from pathlib import Path
 
+
+def _repo_root_candidates(nb_path: str):
+    """Ordered list of Path parents that might contain address_correction_ranking_pipeline.py."""
+    if not nb_path:
+        return []
+    nb_path = nb_path.strip()
+    p = Path(nb_path)
+    out = [p.parent]
+    if nb_path.startswith("/Users/"):
+        tail = nb_path[len("/Users/") :].lstrip("/")
+        mapped = Path("/Workspace/Users") / tail
+        out.append(mapped.parent)
+    if nb_path.startswith("/Repos/"):
+        mapped = Path("/Workspace") / nb_path.lstrip("/")
+        out.append(mapped.parent)
+    # De-dupe while preserving order
+    seen = set()
+    deduped = []
+    for q in out:
+        s = str(q)
+        if s not in seen:
+            seen.add(s)
+            deduped.append(q)
+    return deduped
+
+
 try:
     nb_path = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
+    repo_root = None
+    fallback_root = None
     if nb_path:
-        # Parent of this notebook = directory that should contain the pipeline .py
-        # (workspace path like /Repos/.../address_correction/Run_Databricks_Ranking)
-        repo_root = str(Path(nb_path).parent)
+        marker = Path("address_correction_ranking_pipeline.py")
+        for cand in _repo_root_candidates(nb_path):
+            if not cand.is_dir():
+                continue
+            if fallback_root is None:
+                fallback_root = str(cand)
+            if (cand / marker).is_file():
+                repo_root = str(cand)
+                break
+        if repo_root is None:
+            repo_root = fallback_root
+
+    if repo_root:
         if repo_root not in sys.path:
             sys.path.insert(0, repo_root)
-        os.chdir(repo_root)
+        try:
+            os.chdir(repo_root)
+        except OSError as e:
+            print(f"Note: could not chdir to {repo_root!r} ({e}); sys.path was updated.")
+    else:
+        raise RuntimeError(f"No existing repo root derived from notebookPath={nb_path!r}")
 except Exception as e:
     print(f"Could not resolve notebook path ({e}); using cwd only.")
     sys.path.insert(0, os.getcwd())
