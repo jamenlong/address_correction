@@ -46,6 +46,7 @@ import logging
 import os
 import pickle
 import random
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -108,6 +109,13 @@ class PipelineConfig:
     ranking_prompt_template: str = (
         "match product:\ninput: {noisy}\ncandidate: {candidate}"
     )
+    # Strip punctuation from the noisy (malformed) side before encoder + ranking
+    # prompts. Non-alphanumeric characters become a single space; repeated spaces collapse.
+    preprocess_noisy_remove_special_chars: bool = True
+    # Collapse runs of this many or more identical letters (case-insensitive) to
+    # one letter after noisy cleaning. 3 keeps doubles like *street* / *book*; 2
+    # collapses any repeated letter pair (more aggressive).
+    collapse_repeated_alpha_min_run: int = 3
 
     # Training
     artifact_dir: str = "/tmp/address_correction_ranking"
@@ -172,6 +180,61 @@ class PipelineResult:
     eval_examples: List[Dict[str, Any]]
     eval_accuracy: float
     mlflow_run_id: Optional[str] = None
+
+
+def _collapse_repeated_alpha_letters(s: str, min_run: int = 3) -> str:
+    """Collapse long runs of the same letter (case-insensitive) to one letter.
+
+    Runs shorter than ``min_run`` are left unchanged so common doubles like
+    ``ee`` in *street* or ``oo`` in *book* stay intact; malformed stretches like
+    ``eeeeeeee`` still collapse to a single letter when ``min_run`` is 3.
+    Digits are never merged.
+    """
+    if min_run < 2:
+        min_run = 2
+    out: List[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch.isalpha():
+            lo = ch.lower()
+            j = i + 1
+            while j < n and s[j].isalpha() and s[j].lower() == lo:
+                j += 1
+            run_len = j - i
+            if run_len >= min_run:
+                out.append(ch)
+            else:
+                out.extend(s[i:j])
+            i = j
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def preprocess_noisy_for_ranking(text: Any, cfg: PipelineConfig) -> str:
+    """Normalize malformed line text before encoder query and ranking prompts.
+
+    Non-alphanumeric characters become spaces; runs of spaces collapse to one.
+    Then runs of ``collapse_repeated_alpha_min_run`` or more identical letters
+    (case-insensitive) collapse to a single letter; digits are unchanged.
+    Canonical / catalog candidates are unchanged.
+    """
+    s = "" if text is None else str(text).strip()
+    if not s or not cfg.preprocess_noisy_remove_special_chars:
+        return s
+    buf: List[str] = []
+    for ch in s:
+        if ch.isalnum():
+            buf.append(ch)
+        else:
+            buf.append(" ")
+    s = "".join(buf)
+    s = re.sub(r"\s+", " ", s).strip()
+    m = max(2, int(cfg.collapse_repeated_alpha_min_run))
+    return _collapse_repeated_alpha_letters(s, min_run=m)
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +418,10 @@ def _encoder_shortlist_indices(
 
 
 def build_true_to_noisy_map(
-    rows: Iterable[Dict[str, Any]], noisy_col: str, canonical_col: str
+    rows: Iterable[Dict[str, Any]],
+    noisy_col: str,
+    canonical_col: str,
+    cfg: PipelineConfig,
 ) -> Dict[str, List[str]]:
     from collections import defaultdict
 
@@ -365,7 +431,7 @@ def build_true_to_noisy_map(
         val = r.get(noisy_col)
         if key is None or val is None:
             continue
-        m[str(key)].append(str(val))
+        m[str(key)].append(preprocess_noisy_for_ranking(val, cfg))
     return dict(m)
 
 
@@ -388,7 +454,7 @@ def build_hard_negative_map(
 
     for idx, row in enumerate(tqdm(train_rows, desc="Hard negatives")):
         true_product = str(row[canonical_col])
-        noisy_input = str(row[noisy_col])
+        noisy_input = preprocess_noisy_for_ranking(row[noisy_col], cfg)
         ti = cat_index.get(true_product)
         if ti is None:
             out[idx] = {
@@ -421,7 +487,8 @@ def build_hard_negative_map(
 
 
 def ranking_prompt(cfg: PipelineConfig, noisy: str, candidate: str) -> str:
-    return cfg.ranking_prompt_template.format(noisy=noisy, candidate=candidate)
+    noisy_use = preprocess_noisy_for_ranking(noisy, cfg)
+    return cfg.ranking_prompt_template.format(noisy=noisy_use, candidate=candidate)
 
 
 def tokenize_row_dict(
@@ -768,7 +835,8 @@ def evaluate_closed_set_ranking(
     for row in tqdm(test_rows, desc="Eval (shortlist)"):
         if cfg.eval_max_rows is not None and n >= cfg.eval_max_rows:
             break
-        noisy = str(row[noisy_col])
+        noisy_raw = str(row[noisy_col])
+        noisy = preprocess_noisy_for_ranking(noisy_raw, cfg)
         true_c = str(row[canonical_col])
         q = mean_pool_encoder(
             model, tokenizer, [noisy], batch_size=1, device=device
@@ -850,7 +918,8 @@ def evaluate_closed_set_ranking(
         n += 1
         results.append(
             {
-                "noisy": noisy,
+                "noisy": noisy_raw,
+                "clean_address": noisy,
                 "true": true_c,
                 "predicted": predicted,
                 "predicted_prefers_yes": prefers_yes,
@@ -947,6 +1016,9 @@ def eval_examples_as_flat_records(
         out.append(
             {
                 "noisy": _eval_display_str(r.get("noisy")),
+                "clean_address": _eval_display_str(
+                    r.get("clean_address", r.get("noisy_preprocessed", r.get("noisy")))
+                ),
                 "true": _eval_display_str(r.get("true")),
                 "predicted": _eval_display_str(pred),
                 "predicted_prefers_yes": _cell_bool(r.get("predicted_prefers_yes")),
@@ -1091,7 +1163,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
         random_state=cfg.train_test_split_seed,
     )
 
-    true_to_noisy = build_true_to_noisy_map(train_rows, noisy_col, canonical_col)
+    true_to_noisy = build_true_to_noisy_map(train_rows, noisy_col, canonical_col, cfg)
     hn_map = build_hard_negative_map(
         train_rows, catalog, catalog_embeddings, true_to_noisy, cfg
     )
@@ -1191,6 +1263,12 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
                     "eval_ranker_max_encoder_rank": str(
                         cfg.eval_ranker_max_encoder_rank
                     ),
+                    "preprocess_noisy_remove_special_chars": str(
+                        cfg.preprocess_noisy_remove_special_chars
+                    ),
+                    "collapse_repeated_alpha_min_run": str(
+                        cfg.collapse_repeated_alpha_min_run
+                    ),
                 }
             )
             mlflow.log_metrics(
@@ -1225,6 +1303,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
                 out_rows.append(
                     (
                         r["noisy"],
+                        str(r.get("clean_address", r.get("noisy_preprocessed", r["noisy"]))),
                         r["true"],
                         r["predicted"],
                         r["is_correct"],
@@ -1238,7 +1317,7 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
             sdf = spark.createDataFrame(
                 out_rows,
                 schema=(
-                    "noisy STRING, true_canonical STRING, predicted STRING, is_correct BOOLEAN, "
+                    "noisy STRING, clean_address STRING, true_canonical STRING, predicted STRING, is_correct BOOLEAN, "
                     "predicted_prefers_yes BOOLEAN, scores_json STRING, nll_yes_json STRING, "
                     "nll_no_json STRING, jw_score DOUBLE"
                 ),
@@ -1278,6 +1357,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     p.add_argument("--max-train-rows", type=int, default=None, help="Cap rows after load for smoke tests")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--eval-shortlist-k", type=int, default=64)
+    p.add_argument(
+        "--collapse-alpha-min-run",
+        type=int,
+        default=3,
+        help="Min length of same-letter run to collapse to one (>=2; default 3 keeps street/book).",
+    )
+    p.add_argument(
+        "--no-noisy-strip-special-chars",
+        action="store_true",
+        help="Do not strip punctuation from noisy text before ranking (default strips).",
+    )
+
     args = p.parse_args(argv)
 
     cfg = PipelineConfig(
@@ -1290,6 +1381,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         max_rows=args.max_train_rows or args.max_rows,
         num_train_epochs=args.epochs,
         eval_shortlist_k=args.eval_shortlist_k,
+        preprocess_noisy_remove_special_chars=not args.no_noisy_strip_special_chars,
+        collapse_repeated_alpha_min_run=args.collapse_alpha_min_run,
     )
     if args.parquet:
         cfg.source_table = None

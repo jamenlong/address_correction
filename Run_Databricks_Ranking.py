@@ -56,6 +56,17 @@ dbutils.widgets.dropdown(
     "How to combine NLL margin vs encoder in eval",
 )
 dbutils.widgets.text("eval_encoder_blend_weight", "2.0", "For encoder_margin_blend: weight on [0,1] norm encoder cos")
+dbutils.widgets.dropdown(
+    "preprocess_noisy_remove_special_chars",
+    "true",
+    ["true", "false"],
+    "Non-alnum → space, collapse spaces, on noisy line before encoder + ranker",
+)
+dbutils.widgets.text(
+    "collapse_repeated_alpha_min_run",
+    "3",
+    "Collapse same-letter runs of this length+ to one (3 keeps street/book; 2 is stricter)",
+)
 dbutils.widgets.text("mlflow_experiment", "", "Optional MLflow experiment path (empty = skip MLflow logging)")
 dbutils.widgets.text("predictions_table", "", "Optional Hive table for eval rows, e.g. model_output.my_eval_run")
 
@@ -191,6 +202,13 @@ if source == "parquet":
         eval_encoder_blend_weight=_opt_float(
             "eval_encoder_blend_weight", 2.0
         ),
+        preprocess_noisy_remove_special_chars=(
+            dbutils.widgets.get("preprocess_noisy_remove_special_chars").strip().lower()
+            == "true"
+        ),
+        collapse_repeated_alpha_min_run=_opt_int_nonneg(
+            "collapse_repeated_alpha_min_run", 3
+        ),
         mlflow_experiment_name=(dbutils.widgets.get("mlflow_experiment").strip() or None),
         predictions_table=(dbutils.widgets.get("predictions_table").strip() or None),
     )
@@ -211,6 +229,13 @@ else:
         eval_pick_policy=dbutils.widgets.get("eval_pick_policy").strip(),
         eval_encoder_blend_weight=_opt_float(
             "eval_encoder_blend_weight", 2.0
+        ),
+        preprocess_noisy_remove_special_chars=(
+            dbutils.widgets.get("preprocess_noisy_remove_special_chars").strip().lower()
+            == "true"
+        ),
+        collapse_repeated_alpha_min_run=_opt_int_nonneg(
+            "collapse_repeated_alpha_min_run", 3
         ),
         mlflow_experiment_name=(dbutils.widgets.get("mlflow_experiment").strip() or None),
         predictions_table=(dbutils.widgets.get("predictions_table").strip() or None),
@@ -241,6 +266,8 @@ print(f"  use_spark_tokenization: {cfg.use_spark_tokenization}")
 print(f"  eval_ranker_max_encoder_rank: {cfg.eval_ranker_max_encoder_rank}")
 print(f"  eval_pick_policy: {cfg.eval_pick_policy!r}")
 print(f"  eval_encoder_blend_weight: {cfg.eval_encoder_blend_weight}")
+print(f"  preprocess_noisy_remove_special_chars: {cfg.preprocess_noisy_remove_special_chars}")
+print(f"  collapse_repeated_alpha_min_run: {cfg.collapse_repeated_alpha_min_run}")
 print(
     "  Ranking examples per source row ≈ 1 + len(hard_negatives); worst case grows with "
     "neighbors/noisy candidates. tqdm 'Tokenize (chunk concat)' shows source rows/s; a long "
