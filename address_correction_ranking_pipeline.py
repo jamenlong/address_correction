@@ -635,6 +635,34 @@ def train_ranking_model(
 # ---------------------------------------------------------------------------
 
 
+def _normalize_ranking_label(decoded: str) -> str:
+    """Map decoder text to ``yes`` / ``no`` / ``""`` for eval.
+
+    Training targets are literal ``yes`` / ``no``, but generation often returns
+    ``yes.``, ``yes\n``, leading/trailing noise, or (if decoding is loose) a
+    last line with the label. Exact ``== "yes"`` would then leave ``predicted``
+    as None and the flat ``predicted`` column empty for every row.
+    """
+    s = (decoded or "").strip().lower()
+    if not s:
+        return ""
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    if lines:
+        s = lines[-1]
+    s = s.strip()
+    # "yes" / "yes." / "yes," / "yes — …" (label first)
+    if s.startswith("yes") and (len(s) == 3 or not s[3:4].isalnum()):
+        return "yes"
+    if s.startswith("no") and (len(s) == 2 or not s[2:3].isalnum()):
+        return "no"
+    # Last resort: first whitespace-separated token (e.g. "yes, match")
+    for tok in s.replace(",", " ").split():
+        t = tok.strip(".,;:!?'\"")
+        if t == "yes" or t == "no":
+            return t
+    return ""
+
+
 @torch.inference_mode()
 def score_candidates_with_model(
     model: torch.nn.Module,
@@ -659,7 +687,7 @@ def score_candidates_with_model(
         decoded.extend(
             tokenizer.batch_decode(out, skip_special_tokens=True)
         )
-    return [d.strip().lower() for d in decoded]
+    return [_normalize_ranking_label(d) for d in decoded]
 
 
 def shortlist_catalog_indices(
