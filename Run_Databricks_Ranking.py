@@ -212,7 +212,7 @@ result = run_pipeline(cfg)
 print("Done.")
 print("Artifacts:", result.artifact_dir)
 print("Trained model dir:", result.model_dir)
-print("Eval accuracy (shortlist):", result.eval_accuracy)
+print("Eval top-1 accuracy (best = argmin NLL 'yes' on shortlist):", result.eval_accuracy)
 
 # COMMAND ----------
 

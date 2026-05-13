@@ -635,32 +635,18 @@ def train_ranking_model(
 # ---------------------------------------------------------------------------
 
 
-def _normalize_ranking_label(decoded: str) -> str:
-    """Map decoder text to ``yes`` / ``no`` / ``""`` for eval.
-
-    Training targets are literal ``yes`` / ``no``, but generation often returns
-    ``yes.``, ``yes\n``, leading/trailing noise, or (if decoding is loose) a
-    last line with the label. Exact ``== "yes"`` would then leave ``predicted``
-    as None and the flat ``predicted`` column empty for every row.
-    """
-    s = (decoded or "").strip().lower()
-    if not s:
-        return ""
-    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
-    if lines:
-        s = lines[-1]
-    s = s.strip()
-    # "yes" / "yes." / "yes," / "yes — …" (label first)
-    if s.startswith("yes") and (len(s) == 3 or not s[3:4].isalnum()):
-        return "yes"
-    if s.startswith("no") and (len(s) == 2 or not s[2:3].isalnum()):
-        return "no"
-    # Last resort: first whitespace-separated token (e.g. "yes, match")
-    for tok in s.replace(",", " ").split():
-        t = tok.strip(".,;:!?'\"")
-        if t == "yes" or t == "no":
-            return t
-    return ""
+def _total_nll_for_target(
+    model: torch.nn.Module,
+    enc_one: Dict[str, torch.Tensor],
+    label_ids: torch.Tensor,
+) -> float:
+    """Approximate total NLL for a forced target string (mean CE * #label tokens)."""
+    out = model(**enc_one, labels=label_ids)
+    if out.loss is None:
+        return float("inf")
+    # HF returns mean over non-ignored label positions; scale for length-neutral vs other targets.
+    ntok = max(int(label_ids.shape[1]), 1)
+    return float(out.loss) * float(ntok)
 
 
 @torch.inference_mode()
@@ -671,9 +657,26 @@ def score_candidates_with_model(
     device: torch.device,
     batch_size: int = 32,
     max_new_tokens: int = 8,
-) -> List[str]:
+) -> List[Tuple[float, float, str]]:
+    """Per-candidate forced-target NLL for ``yes`` / ``no`` and a coarse label.
+
+    Returns one tuple per prompt: ``(nll_yes, nll_no, prefers_yes_label)`` where
+    ``prefers_yes_label`` is ``\"yes\"`` if ``nll_yes < nll_no``, else ``\"no\"``
+    (ties treated as ``\"no\"``). On forward errors, ``(inf, inf, \"\")``.
+
+    The **best** match among candidates is chosen by **lowest** ``nll_yes`` (MLE
+    for the training target ``yes``), not by the first ``\"yes\"`` label.
+    """
+    del max_new_tokens  # kept for call-site compatibility
     model.eval()
-    decoded: List[str] = []
+    yes_ids = tokenizer(
+        "yes", return_tensors="pt", add_special_tokens=True
+    ).input_ids.to(device)
+    no_ids = tokenizer(
+        "no", return_tensors="pt", add_special_tokens=True
+    ).input_ids.to(device)
+
+    out_rows: List[Tuple[float, float, str]] = []
     for i in range(0, len(prompts), batch_size):
         batch = prompts[i : i + batch_size]
         enc = tokenizer(
@@ -683,11 +686,22 @@ def score_candidates_with_model(
             max_length=512,
             return_tensors="pt",
         ).to(device)
-        out = model.generate(**enc, max_new_tokens=max_new_tokens)
-        decoded.extend(
-            tokenizer.batch_decode(out, skip_special_tokens=True)
-        )
-    return [_normalize_ranking_label(d) for d in decoded]
+        bs = enc["input_ids"].shape[0]
+        for j in range(bs):
+            enc_j = {k: v[j : j + 1] for k, v in enc.items() if torch.is_tensor(v)}
+            try:
+                ly = _total_nll_for_target(model, enc_j, yes_ids)
+                ln = _total_nll_for_target(model, enc_j, no_ids)
+            except Exception:
+                out_rows.append((float("inf"), float("inf"), ""))
+                continue
+            if ly < ln:
+                out_rows.append((ly, ln, "yes"))
+            elif ly > ln:
+                out_rows.append((ly, ln, "no"))
+            else:
+                out_rows.append((ly, ln, "no"))
+    return out_rows
 
 
 def shortlist_catalog_indices(
@@ -743,16 +757,20 @@ def evaluate_closed_set_ranking(
             rest = [c for c in candidates if c != true_c]
             candidates = [true_c] + rest[: max(0, cfg.eval_shortlist_k - 1)]
         prompts = [ranking_prompt(cfg, noisy, c) for c in candidates]
-        preds = score_candidates_with_model(
+        details = score_candidates_with_model(
             model, tokenizer, prompts, device=device
         )
-        scores = {c: p for c, p in zip(candidates, preds)}
-        # Prefer first 'yes' among shortlist order (highest similarity first)
-        predicted = None
-        for c in candidates:
-            if scores.get(c) == "yes":
-                predicted = c
-                break
+        nll_yes = {c: float(d[0]) for c, d in zip(candidates, details)}
+        nll_no = {c: float(d[1]) for c, d in zip(candidates, details)}
+        scores = {c: d[2] for c, d in zip(candidates, details)}
+        # Best pick = lowest forced "yes" NLL (MLE for the training target); ties
+        # -> earlier shortlist position (higher encoder similarity).
+        best_i = min(
+            range(len(candidates)),
+            key=lambda i: (details[i][0], i),
+        )
+        predicted = candidates[best_i]
+        prefers_yes = details[best_i][0] < details[best_i][1]
         is_correct = predicted == true_c
         if is_correct:
             correct += 1
@@ -762,8 +780,11 @@ def evaluate_closed_set_ranking(
                 "noisy": noisy,
                 "true": true_c,
                 "predicted": predicted,
+                "predicted_prefers_yes": prefers_yes,
                 "is_correct": is_correct,
                 "scores": scores,
+                "nll_yes": nll_yes,
+                "nll_no": nll_no,
                 "shortlist": candidates,
             }
         )
@@ -807,14 +828,32 @@ def eval_examples_as_flat_records(
         shortlist = r.get("shortlist")
         if not isinstance(shortlist, list):
             shortlist = []
+        nll_yes = r.get("nll_yes")
+        nll_no = r.get("nll_no")
+        if not isinstance(nll_yes, dict):
+            nll_yes = {}
+        if not isinstance(nll_no, dict):
+            nll_no = {}
+        ppy = r.get("predicted_prefers_yes")
+        try:
+            prefers_yes = bool(ppy) if ppy is not None else False
+        except (TypeError, ValueError):
+            prefers_yes = False
         out.append(
             {
                 "noisy": _eval_display_str(r.get("noisy")),
                 "true": _eval_display_str(r.get("true")),
                 "predicted": _eval_display_str(pred),
+                "predicted_prefers_yes": prefers_yes,
                 "is_correct": is_correct,
                 "scores_json": json.dumps(
                     scores, ensure_ascii=False, default=str, sort_keys=False
+                ),
+                "nll_yes_json": json.dumps(
+                    nll_yes, ensure_ascii=False, default=str, sort_keys=False
+                ),
+                "nll_no_json": json.dumps(
+                    nll_no, ensure_ascii=False, default=str, sort_keys=False
                 ),
                 "shortlist_json": json.dumps(
                     shortlist, ensure_ascii=False, default=str
@@ -825,14 +864,19 @@ def eval_examples_as_flat_records(
 
 
 def top_k_accuracy_from_results(results: List[Dict[str, Any]], k: int = 3) -> float:
-    """Uses per-row 'scores' dict: true is correct if in first k candidates with score 'yes' in shortlist order."""
+    """Top-k accuracy when candidates are ordered by ascending ``nll_yes`` (tie: shortlist order)."""
     if not results:
         return 0.0
     hit = 0
     for r in results:
-        yes_list = [c for c, v in r["scores"].items() if v == "yes"]
-        # preserve shortlist order
-        ordered = [c for c in r["shortlist"] if c in yes_list]
+        cand = r.get("shortlist") or []
+        ny = r.get("nll_yes") or {}
+        if not cand:
+            continue
+        ordered = sorted(
+            cand,
+            key=lambda c: (float(ny.get(c, float("inf"))), cand.index(c)),
+        )
         if r["true"] in ordered[:k]:
             hit += 1
     return hit / len(results)
@@ -987,8 +1031,8 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
     )
     topk = top_k_accuracy_from_results(eval_results, k=3)
 
-    logger.info("Eval accuracy (shortlist argmax yes): %.4f", acc)
-    logger.info("Top-3 yes accuracy: %.4f", topk)
+    logger.info("Eval top-1 accuracy (argmin NLL yes on shortlist): %.4f", acc)
+    logger.info("Eval top-3 accuracy (rank by NLL yes on shortlist): %.4f", topk)
 
     mlflow_run_id = None
     if cfg.mlflow_experiment_name:
@@ -1003,7 +1047,13 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
                     "hub_model_id": cfg.hub_model_id,
                 }
             )
-            mlflow.log_metrics({**{f"eval_{k}": v for k, v in eval_metrics.items()}, "shortlist_acc": acc, "top3_yes": topk})
+            mlflow.log_metrics(
+                {
+                    **{f"eval_{k}": v for k, v in eval_metrics.items()},
+                    "shortlist_top1_argmin_nll_yes": acc,
+                    "shortlist_top3_argmin_nll_yes": topk,
+                }
+            )
             if cfg.mlflow_registered_model_name:
                 from transformers import pipeline as hf_pipeline
 
@@ -1032,13 +1082,20 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
                         r["true"],
                         r["predicted"],
                         r["is_correct"],
+                        bool(r.get("predicted_prefers_yes", False)),
                         json.dumps(r["scores"]),
-                        jaro_winkler(r["true"], r["predicted"] or ""),
+                        json.dumps(r.get("nll_yes") or {}),
+                        json.dumps(r.get("nll_no") or {}),
+                        jaro_winkler(r["true"], str(r.get("predicted") or "")),
                     )
                 )
             sdf = spark.createDataFrame(
                 out_rows,
-                schema="noisy STRING, true_canonical STRING, predicted STRING, is_correct BOOLEAN, scores_json STRING, jw_score DOUBLE",
+                schema=(
+                    "noisy STRING, true_canonical STRING, predicted STRING, is_correct BOOLEAN, "
+                    "predicted_prefers_yes BOOLEAN, scores_json STRING, nll_yes_json STRING, "
+                    "nll_no_json STRING, jw_score DOUBLE"
+                ),
             )
             sdf.write.mode("overwrite").saveAsTable(cfg.predictions_table)
         except Exception as e:
