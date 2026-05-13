@@ -46,6 +46,7 @@ import logging
 import os
 import pickle
 import random
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -130,13 +131,17 @@ class PipelineConfig:
     # How to pick one line from shortlist NLL scores (shortlist order only tie-breaks).
     # "min_nll_yes" = argmin forced NLL("yes") — can latch onto one globally "easy-yes"
     # catalog line (frequent in training) even when the true line is encoder rank 1.
-    # "max_yes_no_margin" (default) = argmax (NLL("no")-NLL("yes")): strongest yes vs no.
-    # "encoder_margin_blend" = margin + eval_encoder_blend_weight * norm_cos(enc(noisy), enc(c)).
+    # "max_yes_no_margin" = argmax (NLL("no")-NLL("yes")): strongest yes vs no.
+    # "encoder_margin_blend" (default) = margin + eval_encoder_blend_weight * norm encoder cos.
     eval_pick_policy: str = "encoder_margin_blend"
     eval_encoder_blend_weight: float = 2.0
     # Only the first N shortlist lines (encoder order) get T5 NLL scoring and can be
     # chosen as predicted. 0 = score the full shortlist (slow; deep lines can hijack).
     eval_ranker_max_encoder_rank: int = 24
+    # When noisy text contains STE/UNIT/APT/#… fragments missing from a catalog
+    # candidate, subtract this per capped hit from pick_score (reduces bare-building wins).
+    eval_lexical_penalty_per_missing_unit: float = 2.5
+    eval_lexical_max_unit_penalties: int = 6
 
     # Optional MLflow
     mlflow_experiment_name: Optional[str] = None
@@ -742,6 +747,36 @@ def shortlist_catalog_indices(
     return _encoder_shortlist_indices(q, catalog_embeddings, top_k)
 
 
+_EVAL_SUITE_UNIT_RE = re.compile(
+    r"\b(?:STE|SUITE|UNIT|APT|BLDG|FLR?|FLOOR|RM|ROOM|LOT)\b\s*[.#:,-]?\s*([A-Z0-9][A-Z0-9/-]*)",
+    re.I,
+)
+_EVAL_HASH_UNIT_RE = re.compile(r"#\s*([A-Z0-9][A-Z0-9/-]*)", re.I)
+
+
+def _addr_fold(s: str) -> str:
+    """Uppercase and remove whitespace for robust substring checks."""
+    return "".join(str(s).upper().split())
+
+
+def _missing_structure_units(noisy: str, candidate: str) -> int:
+    """Distinct suite/unit fragments from ``noisy`` not contained in ``candidate`` (folded)."""
+    cfold = _addr_fold(candidate)
+    seen: set[str] = set()
+    n = 0
+    for rx in (_EVAL_SUITE_UNIT_RE, _EVAL_HASH_UNIT_RE):
+        for m in rx.finditer(str(noisy)):
+            key = _addr_fold(m.group(0))
+            if len(key) < 3:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            if key not in cfold:
+                n += 1
+    return n
+
+
 def evaluate_closed_set_ranking(
     model: torch.nn.Module,
     tokenizer: Any,
@@ -822,17 +857,27 @@ def evaluate_closed_set_ranking(
             c: float(enc_sims_full[i]) for i, c in enumerate(candidates)
         }
         pick_scores: Dict[str, float] = {}
+        lexical_misses: Dict[str, int] = {}
+        pen = float(cfg.eval_lexical_penalty_per_missing_unit)
+        cap_missing = int(cfg.eval_lexical_max_unit_penalties)
         for i, c in enumerate(rank_cands):
             ly, ln = float(details[i][0]), float(details[i][1])
             margin = ln - ly
             if policy == "min_nll_yes":
-                pick_scores[c] = -ly
+                base = -ly
             elif policy == "max_yes_no_margin":
-                pick_scores[c] = margin
+                base = margin
             else:
-                pick_scores[c] = (
-                    margin + cfg.eval_encoder_blend_weight * enc_norm[i]
-                )
+                base = margin + cfg.eval_encoder_blend_weight * enc_norm[i]
+            miss_raw = _missing_structure_units(noisy, c)
+            lexical_misses[c] = miss_raw
+            if cap_missing > 0:
+                miss_apply = min(miss_raw, cap_missing)
+            else:
+                miss_apply = miss_raw
+            if pen > 0.0:
+                base = base - pen * float(miss_apply)
+            pick_scores[c] = base
         ordered = sorted(
             rank_cands,
             key=lambda c: (
@@ -864,6 +909,7 @@ def evaluate_closed_set_ranking(
                 "eval_pick_policy": policy,
                 "eval_ranker_max_encoder_rank": mrank,
                 "ranker_pool": list(rank_cands),
+                "lexical_missing_units": lexical_misses,
                 "shortlist": candidates,
             }
         )
@@ -944,6 +990,9 @@ def eval_examples_as_flat_records(
         rp = r.get("ranker_pool")
         if not isinstance(rp, list):
             rp = []
+        lxm = r.get("lexical_missing_units")
+        if not isinstance(lxm, dict):
+            lxm = {}
         out.append(
             {
                 "noisy": _eval_display_str(r.get("noisy")),
@@ -955,6 +1004,9 @@ def eval_examples_as_flat_records(
                 "eval_ranker_max_encoder_rank": mrank_i,
                 "ranker_pool_json": json.dumps(
                     rp, ensure_ascii=False, default=str
+                ),
+                "lexical_missing_units_json": json.dumps(
+                    lxm, ensure_ascii=False, default=str, sort_keys=False
                 ),
                 "scores_json": json.dumps(
                     scores, ensure_ascii=False, default=str, sort_keys=False
@@ -1190,6 +1242,12 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
                     "eval_encoder_blend_weight": str(cfg.eval_encoder_blend_weight),
                     "eval_ranker_max_encoder_rank": str(
                         cfg.eval_ranker_max_encoder_rank
+                    ),
+                    "eval_lexical_penalty_per_missing_unit": str(
+                        cfg.eval_lexical_penalty_per_missing_unit
+                    ),
+                    "eval_lexical_max_unit_penalties": str(
+                        cfg.eval_lexical_max_unit_penalties
                     ),
                 }
             )

@@ -56,6 +56,16 @@ dbutils.widgets.dropdown(
     "How to combine NLL margin vs encoder in eval",
 )
 dbutils.widgets.text("eval_encoder_blend_weight", "2.0", "For encoder_margin_blend: weight on [0,1] norm encoder cos")
+dbutils.widgets.text(
+    "eval_lexical_penalty_per_missing_unit",
+    "2.5",
+    "Subtract this x (# suite/unit tokens in noisy missing from candidate) from pick_score; 0=off",
+)
+dbutils.widgets.text(
+    "eval_lexical_max_unit_penalties",
+    "6",
+    "Max suite/unit misses counted per candidate toward that penalty (0=no cap)",
+)
 dbutils.widgets.text("mlflow_experiment", "", "Optional MLflow experiment path (empty = skip MLflow logging)")
 dbutils.widgets.text("predictions_table", "", "Optional Hive table for eval rows, e.g. model_output.my_eval_run")
 
@@ -191,6 +201,12 @@ if source == "parquet":
         eval_encoder_blend_weight=_opt_float(
             "eval_encoder_blend_weight", 2.0
         ),
+        eval_lexical_penalty_per_missing_unit=_opt_float(
+            "eval_lexical_penalty_per_missing_unit", 2.5
+        ),
+        eval_lexical_max_unit_penalties=_opt_int_nonneg(
+            "eval_lexical_max_unit_penalties", 6
+        ),
         mlflow_experiment_name=(dbutils.widgets.get("mlflow_experiment").strip() or None),
         predictions_table=(dbutils.widgets.get("predictions_table").strip() or None),
     )
@@ -211,6 +227,12 @@ else:
         eval_pick_policy=dbutils.widgets.get("eval_pick_policy").strip(),
         eval_encoder_blend_weight=_opt_float(
             "eval_encoder_blend_weight", 2.0
+        ),
+        eval_lexical_penalty_per_missing_unit=_opt_float(
+            "eval_lexical_penalty_per_missing_unit", 2.5
+        ),
+        eval_lexical_max_unit_penalties=_opt_int_nonneg(
+            "eval_lexical_max_unit_penalties", 6
         ),
         mlflow_experiment_name=(dbutils.widgets.get("mlflow_experiment").strip() or None),
         predictions_table=(dbutils.widgets.get("predictions_table").strip() or None),
@@ -241,6 +263,10 @@ print(f"  use_spark_tokenization: {cfg.use_spark_tokenization}")
 print(f"  eval_ranker_max_encoder_rank: {cfg.eval_ranker_max_encoder_rank}")
 print(f"  eval_pick_policy: {cfg.eval_pick_policy!r}")
 print(f"  eval_encoder_blend_weight: {cfg.eval_encoder_blend_weight}")
+print(
+    f"  eval_lexical_penalty_per_missing_unit: {cfg.eval_lexical_penalty_per_missing_unit}"
+)
+print(f"  eval_lexical_max_unit_penalties: {cfg.eval_lexical_max_unit_penalties}")
 print(
     "  Ranking examples per source row ≈ 1 + len(hard_negatives); worst case grows with "
     "neighbors/noisy candidates. tqdm 'Tokenize (chunk concat)' shows source rows/s; a long "
