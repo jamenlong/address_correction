@@ -757,6 +757,8 @@ def evaluate_closed_set_ranking(
             f"encoder_margin_blend (got {cfg.eval_pick_policy!r})"
         )
     cat_to_i = {c: i for i, c in enumerate(catalog)}
+    # Advanced indexing requires index tensor on the same device as the indexed tensor.
+    cat_emb = catalog_embeddings.to(device=device, dtype=catalog_embeddings.dtype)
     results: List[Dict[str, Any]] = []
     correct = 0
     n = 0
@@ -769,7 +771,7 @@ def evaluate_closed_set_ranking(
             model, tokenizer, [noisy], batch_size=1, device=device
         ).to(device)
         idxs = _encoder_shortlist_indices(
-            q, catalog_embeddings, cfg.eval_shortlist_k
+            q, cat_emb, cfg.eval_shortlist_k
         )
         candidates = [catalog[i] for i in idxs]
         # Ensure the gold label is scoreable (shortlist is approximate retrieval).
@@ -788,11 +790,11 @@ def evaluate_closed_set_ranking(
             for i, c in enumerate(candidates)
         }
         ii = torch.tensor(
-            [cat_to_i[c] for c in candidates], device=device, dtype=torch.long
+            [cat_to_i[c] for c in candidates],
+            device=cat_emb.device,
+            dtype=torch.long,
         )
-        enc_sims = (
-            (catalog_embeddings[ii].to(device) * q).sum(dim=1).detach().cpu().tolist()
-        )
+        enc_sims = (cat_emb[ii] * q).sum(dim=1).detach().cpu().tolist()
         encoder_cosine = {c: float(enc_sims[i]) for i, c in enumerate(candidates)}
         pick_scores: Dict[str, float] = {}
         for i, c in enumerate(candidates):
