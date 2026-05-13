@@ -131,9 +131,12 @@ class PipelineConfig:
     # "min_nll_yes" = argmin forced NLL("yes") — can latch onto one globally "easy-yes"
     # catalog line (frequent in training) even when the true line is encoder rank 1.
     # "max_yes_no_margin" (default) = argmax (NLL("no")-NLL("yes")): strongest yes vs no.
-    # "encoder_margin_blend" = margin + eval_encoder_blend_weight * cos(enc(noisy), enc(c)).
-    eval_pick_policy: str = "max_yes_no_margin"
-    eval_encoder_blend_weight: float = 0.5
+    # "encoder_margin_blend" = margin + eval_encoder_blend_weight * norm_cos(enc(noisy), enc(c)).
+    eval_pick_policy: str = "encoder_margin_blend"
+    eval_encoder_blend_weight: float = 2.0
+    # Only the first N shortlist lines (encoder order) get T5 NLL scoring and can be
+    # chosen as predicted. 0 = score the full shortlist (slow; deep lines can hijack).
+    eval_ranker_max_encoder_rank: int = 24
 
     # Optional MLflow
     mlflow_experiment_name: Optional[str] = None
@@ -778,26 +781,48 @@ def evaluate_closed_set_ranking(
         if true_c not in candidates:
             rest = [c for c in candidates if c != true_c]
             candidates = [true_c] + rest[: max(0, cfg.eval_shortlist_k - 1)]
-        prompts = [ranking_prompt(cfg, noisy, c) for c in candidates]
+        mrank = int(getattr(cfg, "eval_ranker_max_encoder_rank", 0) or 0)
+        rank_cands = (
+            candidates[: min(mrank, len(candidates))]
+            if mrank > 0
+            else candidates
+        )
+        prompts = [ranking_prompt(cfg, noisy, c) for c in rank_cands]
         details = score_candidates_with_model(
             model, tokenizer, prompts, device=device
         )
-        nll_yes = {c: float(d[0]) for c, d in zip(candidates, details)}
-        nll_no = {c: float(d[1]) for c, d in zip(candidates, details)}
-        scores = {c: d[2] for c, d in zip(candidates, details)}
+        ii_rank = torch.tensor(
+            [cat_to_i[c] for c in rank_cands],
+            device=cat_emb.device,
+            dtype=torch.long,
+        )
+        enc_sims_rank = (
+            (cat_emb[ii_rank] * q).sum(dim=1).detach().cpu().tolist()
+        )
+        lo = min(enc_sims_rank) if enc_sims_rank else 0.0
+        hi = max(enc_sims_rank) if enc_sims_rank else 1.0
+        span = max(hi - lo, 1e-8)
+        enc_norm = [(float(s) - lo) / span for s in enc_sims_rank]
+        nll_yes = {c: float(d[0]) for c, d in zip(rank_cands, details)}
+        nll_no = {c: float(d[1]) for c, d in zip(rank_cands, details)}
+        scores = {c: d[2] for c, d in zip(rank_cands, details)}
         margins = {
             c: float(details[i][1]) - float(details[i][0])
-            for i, c in enumerate(candidates)
+            for i, c in enumerate(rank_cands)
         }
-        ii = torch.tensor(
+        ii_full = torch.tensor(
             [cat_to_i[c] for c in candidates],
             device=cat_emb.device,
             dtype=torch.long,
         )
-        enc_sims = (cat_emb[ii] * q).sum(dim=1).detach().cpu().tolist()
-        encoder_cosine = {c: float(enc_sims[i]) for i, c in enumerate(candidates)}
+        enc_sims_full = (
+            (cat_emb[ii_full] * q).sum(dim=1).detach().cpu().tolist()
+        )
+        encoder_cosine = {
+            c: float(enc_sims_full[i]) for i, c in enumerate(candidates)
+        }
         pick_scores: Dict[str, float] = {}
-        for i, c in enumerate(candidates):
+        for i, c in enumerate(rank_cands):
             ly, ln = float(details[i][0]), float(details[i][1])
             margin = ln - ly
             if policy == "min_nll_yes":
@@ -806,14 +831,18 @@ def evaluate_closed_set_ranking(
                 pick_scores[c] = margin
             else:
                 pick_scores[c] = (
-                    margin + cfg.eval_encoder_blend_weight * float(enc_sims[i])
+                    margin + cfg.eval_encoder_blend_weight * enc_norm[i]
                 )
         ordered = sorted(
-            candidates,
-            key=lambda c: (-pick_scores[c], candidates.index(c)),
+            rank_cands,
+            key=lambda c: (
+                float(pick_scores[c]),
+                -rank_cands.index(c),
+            ),
+            reverse=True,
         )
         predicted = ordered[0]
-        best_i = candidates.index(predicted)
+        best_i = rank_cands.index(predicted)
         prefers_yes = details[best_i][0] < details[best_i][1]
         is_correct = predicted == true_c
         if is_correct:
@@ -833,6 +862,8 @@ def evaluate_closed_set_ranking(
                 "pick_scores": pick_scores,
                 "encoder_cosine": encoder_cosine,
                 "eval_pick_policy": policy,
+                "eval_ranker_max_encoder_rank": mrank,
+                "ranker_pool": list(rank_cands),
                 "shortlist": candidates,
             }
         )
@@ -905,6 +936,14 @@ def eval_examples_as_flat_records(
             encoder_cosine = {}
         pol = r.get("eval_pick_policy")
         policy_str = _eval_display_str(pol) if pol is not None else ""
+        mrank = r.get("eval_ranker_max_encoder_rank")
+        try:
+            mrank_i = int(mrank) if mrank is not None else 0
+        except (TypeError, ValueError):
+            mrank_i = 0
+        rp = r.get("ranker_pool")
+        if not isinstance(rp, list):
+            rp = []
         out.append(
             {
                 "noisy": _eval_display_str(r.get("noisy")),
@@ -913,6 +952,10 @@ def eval_examples_as_flat_records(
                 "predicted_prefers_yes": _cell_bool(r.get("predicted_prefers_yes")),
                 "is_correct": is_correct,
                 "eval_pick_policy": policy_str,
+                "eval_ranker_max_encoder_rank": mrank_i,
+                "ranker_pool_json": json.dumps(
+                    rp, ensure_ascii=False, default=str
+                ),
                 "scores_json": json.dumps(
                     scores, ensure_ascii=False, default=str, sort_keys=False
                 ),
@@ -955,7 +998,11 @@ def top_k_accuracy_from_results(results: List[Dict[str, Any]], k: int = 3) -> fl
         if isinstance(ps, dict) and ps:
             ordered = sorted(
                 cand,
-                key=lambda c: (-float(ps.get(c, float("-inf"))), cand.index(c)),
+                key=lambda c: (
+                    float(ps.get(c, -1e30)),
+                    -cand.index(c),
+                ),
+                reverse=True,
             )
         else:
             ny = r.get("nll_yes") or {}
@@ -1118,8 +1165,9 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
     topk = top_k_accuracy_from_results(eval_results, k=3)
 
     logger.info(
-        "Eval top-1 accuracy (shortlist; policy=%s): %.4f",
+        "Eval top-1 accuracy (shortlist; policy=%s; ranker_pool=%d): %.4f",
         cfg.eval_pick_policy,
+        int(cfg.eval_ranker_max_encoder_rank or 0),
         acc,
     )
     logger.info(
@@ -1140,6 +1188,9 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
                     "hub_model_id": cfg.hub_model_id,
                     "eval_pick_policy": cfg.eval_pick_policy,
                     "eval_encoder_blend_weight": str(cfg.eval_encoder_blend_weight),
+                    "eval_ranker_max_encoder_rank": str(
+                        cfg.eval_ranker_max_encoder_rank
+                    ),
                 }
             )
             mlflow.log_metrics(

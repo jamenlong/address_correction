@@ -44,6 +44,18 @@ dbutils.widgets.text("malform_filter", "legacy_one_comma", "malform_steps_filter
 dbutils.widgets.text("max_rows", "500", "Optional max rows after load (empty = all)")
 dbutils.widgets.text("epochs", "2", "num_train_epochs")
 dbutils.widgets.text("eval_shortlist_k", "64", "Eval encoder shortlist size")
+dbutils.widgets.text(
+    "eval_ranker_max_encoder_rank",
+    "24",
+    "T5 ranker only sees first N encoder-shortlist lines (0 = all; stops deep hijacks)",
+)
+dbutils.widgets.dropdown(
+    "eval_pick_policy",
+    "encoder_margin_blend",
+    ["encoder_margin_blend", "max_yes_no_margin", "min_nll_yes"],
+    "How to combine NLL margin vs encoder in eval",
+)
+dbutils.widgets.text("eval_encoder_blend_weight", "2.0", "For encoder_margin_blend: weight on [0,1] norm encoder cos")
 dbutils.widgets.text("mlflow_experiment", "", "Optional MLflow experiment path (empty = skip MLflow logging)")
 dbutils.widgets.text("predictions_table", "", "Optional Hive table for eval rows, e.g. model_output.my_eval_run")
 
@@ -142,6 +154,20 @@ def _opt_int(name: str):
     return int(raw) if raw else None
 
 
+def _opt_int_nonneg(name: str, default: int) -> int:
+    raw = dbutils.widgets.get(name).strip()
+    if not raw:
+        return default
+    return int(raw)
+
+
+def _opt_float(name: str, default: float) -> float:
+    raw = dbutils.widgets.get(name).strip()
+    if not raw:
+        return default
+    return float(raw)
+
+
 model_uri = dbutils.widgets.get("model_uri").strip() or None
 source = dbutils.widgets.get("data_source")
 if source == "parquet":
@@ -158,6 +184,13 @@ if source == "parquet":
         max_rows=_opt_int("max_rows"),
         num_train_epochs=int(dbutils.widgets.get("epochs").strip() or "2"),
         eval_shortlist_k=int(dbutils.widgets.get("eval_shortlist_k").strip() or "64"),
+        eval_ranker_max_encoder_rank=_opt_int_nonneg(
+            "eval_ranker_max_encoder_rank", 24
+        ),
+        eval_pick_policy=dbutils.widgets.get("eval_pick_policy").strip(),
+        eval_encoder_blend_weight=_opt_float(
+            "eval_encoder_blend_weight", 2.0
+        ),
         mlflow_experiment_name=(dbutils.widgets.get("mlflow_experiment").strip() or None),
         predictions_table=(dbutils.widgets.get("predictions_table").strip() or None),
     )
@@ -172,6 +205,13 @@ else:
         max_rows=_opt_int("max_rows"),
         num_train_epochs=int(dbutils.widgets.get("epochs").strip() or "2"),
         eval_shortlist_k=int(dbutils.widgets.get("eval_shortlist_k").strip() or "64"),
+        eval_ranker_max_encoder_rank=_opt_int_nonneg(
+            "eval_ranker_max_encoder_rank", 24
+        ),
+        eval_pick_policy=dbutils.widgets.get("eval_pick_policy").strip(),
+        eval_encoder_blend_weight=_opt_float(
+            "eval_encoder_blend_weight", 2.0
+        ),
         mlflow_experiment_name=(dbutils.widgets.get("mlflow_experiment").strip() or None),
         predictions_table=(dbutils.widgets.get("predictions_table").strip() or None),
     )
@@ -198,7 +238,9 @@ else:
     )
 print(f"  max_hard_negatives_per_row: {cfg.max_hard_negatives_per_row}")
 print(f"  use_spark_tokenization: {cfg.use_spark_tokenization}")
-print(f"  tokenize_num_proc: {cfg.tokenize_num_proc!r}")
+print(f"  eval_ranker_max_encoder_rank: {cfg.eval_ranker_max_encoder_rank}")
+print(f"  eval_pick_policy: {cfg.eval_pick_policy!r}")
+print(f"  eval_encoder_blend_weight: {cfg.eval_encoder_blend_weight}")
 print(
     "  Ranking examples per source row ≈ 1 + len(hard_negatives); worst case grows with "
     "neighbors/noisy candidates. tqdm 'Tokenize (chunk concat)' shows source rows/s; a long "
