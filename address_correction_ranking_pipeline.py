@@ -849,6 +849,18 @@ def _eval_display_str(v: Any) -> str:
     return str(v)
 
 
+def _cell_bool(v: Any) -> bool:
+    """Stable bool for Spark / numpy / missing flags (e.g. ``predicted_prefers_yes``)."""
+    if v is True:
+        return True
+    if v is False or v is None:
+        return False
+    try:
+        return bool(v)
+    except (TypeError, ValueError):
+        return False
+
+
 def eval_examples_as_flat_records(
     eval_examples: List[Dict[str, Any]],
     limit: Optional[int] = 20,
@@ -893,17 +905,12 @@ def eval_examples_as_flat_records(
             encoder_cosine = {}
         pol = r.get("eval_pick_policy")
         policy_str = _eval_display_str(pol) if pol is not None else ""
-        ppy = r.get("predicted_prefers_yes")
-        try:
-            prefers_yes = bool(ppy) if ppy is not None else False
-        except (TypeError, ValueError):
-            prefers_yes = False
         out.append(
             {
                 "noisy": _eval_display_str(r.get("noisy")),
                 "true": _eval_display_str(r.get("true")),
                 "predicted": _eval_display_str(pred),
-                "predicted_prefers_yes": prefers_yes,
+                "predicted_prefers_yes": _cell_bool(r.get("predicted_prefers_yes")),
                 "is_correct": is_correct,
                 "eval_pick_policy": policy_str,
                 "scores_json": json.dumps(
