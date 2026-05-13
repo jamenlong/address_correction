@@ -893,6 +893,11 @@ def eval_examples_as_flat_records(
             encoder_cosine = {}
         pol = r.get("eval_pick_policy")
         policy_str = _eval_display_str(pol) if pol is not None else ""
+        ppy = r.get("predicted_prefers_yes")
+        try:
+            prefers_yes = bool(ppy) if ppy is not None else False
+        except (TypeError, ValueError):
+            prefers_yes = False
         out.append(
             {
                 "noisy": _eval_display_str(r.get("noisy")),
