@@ -67,6 +67,39 @@ dbutils.widgets.text(
     "3",
     "Collapse same-letter runs of this length+ to one (3 keeps street/book; 2 is stricter)",
 )
+dbutils.widgets.dropdown(
+    "hard_neg_use_query_encoder",
+    "true",
+    ["true", "false"],
+    "Mine hard negatives from enc(noisy) vs catalog (eval-aligned confounders)",
+)
+dbutils.widgets.text(
+    "hard_neg_query_encoder_topk",
+    "64",
+    "How many catalog lines to consider for query-conditioned + lexical pool",
+)
+dbutils.widgets.text(
+    "hard_neg_query_max_count",
+    "8",
+    "Max negatives taken from query-conditioned catalog hits (before lexical/neighbor fill)",
+)
+dbutils.widgets.text(
+    "hard_neg_lexical_max_count",
+    "5",
+    "Max extra negatives from Jaro–Winkler on pool (0 = disable)",
+)
+dbutils.widgets.dropdown(
+    "hard_neg_use_canonical_neighbors",
+    "true",
+    ["true", "false"],
+    "Mine neighbor noisies from catalog lines near gold canonical embedding",
+)
+dbutils.widgets.dropdown(
+    "hard_neg_append_neighbor_canonical",
+    "true",
+    ["true", "false"],
+    "Per neighbor: add catalog string if no training noisies (or after noisies)",
+)
 dbutils.widgets.text("mlflow_experiment", "", "Optional MLflow experiment path (empty = skip MLflow logging)")
 dbutils.widgets.text("predictions_table", "", "Optional Hive table for eval rows, e.g. model_output.my_eval_run")
 
@@ -209,6 +242,24 @@ if source == "parquet":
         collapse_repeated_alpha_min_run=_opt_int_nonneg(
             "collapse_repeated_alpha_min_run", 3
         ),
+        hard_neg_use_query_encoder=(
+            dbutils.widgets.get("hard_neg_use_query_encoder").strip().lower() == "true"
+        ),
+        hard_neg_query_encoder_topk=_opt_int_nonneg(
+            "hard_neg_query_encoder_topk", 64
+        ),
+        hard_neg_query_max_count=_opt_int_nonneg("hard_neg_query_max_count", 8),
+        hard_neg_lexical_max_count=_opt_int_nonneg(
+            "hard_neg_lexical_max_count", 5
+        ),
+        hard_neg_use_canonical_neighbors=(
+            dbutils.widgets.get("hard_neg_use_canonical_neighbors").strip().lower()
+            == "true"
+        ),
+        hard_neg_append_neighbor_canonical=(
+            dbutils.widgets.get("hard_neg_append_neighbor_canonical").strip().lower()
+            == "true"
+        ),
         mlflow_experiment_name=(dbutils.widgets.get("mlflow_experiment").strip() or None),
         predictions_table=(dbutils.widgets.get("predictions_table").strip() or None),
     )
@@ -236,6 +287,24 @@ else:
         ),
         collapse_repeated_alpha_min_run=_opt_int_nonneg(
             "collapse_repeated_alpha_min_run", 3
+        ),
+        hard_neg_use_query_encoder=(
+            dbutils.widgets.get("hard_neg_use_query_encoder").strip().lower() == "true"
+        ),
+        hard_neg_query_encoder_topk=_opt_int_nonneg(
+            "hard_neg_query_encoder_topk", 64
+        ),
+        hard_neg_query_max_count=_opt_int_nonneg("hard_neg_query_max_count", 8),
+        hard_neg_lexical_max_count=_opt_int_nonneg(
+            "hard_neg_lexical_max_count", 5
+        ),
+        hard_neg_use_canonical_neighbors=(
+            dbutils.widgets.get("hard_neg_use_canonical_neighbors").strip().lower()
+            == "true"
+        ),
+        hard_neg_append_neighbor_canonical=(
+            dbutils.widgets.get("hard_neg_append_neighbor_canonical").strip().lower()
+            == "true"
         ),
         mlflow_experiment_name=(dbutils.widgets.get("mlflow_experiment").strip() or None),
         predictions_table=(dbutils.widgets.get("predictions_table").strip() or None),
@@ -268,6 +337,11 @@ print(f"  eval_pick_policy: {cfg.eval_pick_policy!r}")
 print(f"  eval_encoder_blend_weight: {cfg.eval_encoder_blend_weight}")
 print(f"  preprocess_noisy_remove_special_chars: {cfg.preprocess_noisy_remove_special_chars}")
 print(f"  collapse_repeated_alpha_min_run: {cfg.collapse_repeated_alpha_min_run}")
+print(f"  hard_neg_use_query_encoder: {cfg.hard_neg_use_query_encoder}")
+print(f"  hard_neg_query_encoder_topk / max: {cfg.hard_neg_query_encoder_topk} / {cfg.hard_neg_query_max_count}")
+print(f"  hard_neg_lexical_max_count: {cfg.hard_neg_lexical_max_count}")
+print(f"  hard_neg_use_canonical_neighbors: {cfg.hard_neg_use_canonical_neighbors}")
+print(f"  hard_neg_append_neighbor_canonical: {cfg.hard_neg_append_neighbor_canonical}")
 print(
     "  Ranking examples per source row ≈ 1 + len(hard_negatives); worst case grows with "
     "neighbors/noisy candidates. tqdm 'Tokenize (chunk concat)' shows source rows/s; a long "

@@ -95,11 +95,36 @@ class PipelineConfig:
     model_checkpoint_uri: Optional[str] = None
     hub_model_id: str = "t5-small"
 
-    # Hard-negative mining
+    # Hard-negative mining (see ``build_hard_negative_map`` docstring for the full recipe).
     max_neighbors: int = 10
     max_noisy_per_neighbor: int = 5
     max_hard_negatives_per_row: int = 15
     catalog_encode_batch_size: int = 128
+
+    # --- Canonical-neighbor path (legacy): nearest *catalog lines* to the gold canonical
+    # embedding; attach real noisy strings observed for those neighbor lines in training.
+    hard_neg_use_canonical_neighbors: bool = True
+    # When a neighbor has no training noisies, still add its catalog string as a "no"
+    # candidate (aligns training with eval, where candidates are catalog lines).
+    hard_neg_append_neighbor_canonical: bool = True
+    hard_neg_shuffle_neighbors: bool = True
+    hard_neg_shuffle_noisy_per_neighbor: bool = True
+
+    # --- Query-conditioned path: catalog lines most similar to enc(noisy_input), i.e. the
+    # same retrieval geometry used at eval time (encoder shortlist confounders).
+    hard_neg_use_query_encoder: bool = True
+    hard_neg_query_encoder_topk: int = 64
+    hard_neg_query_max_count: int = 8
+    hard_neg_shuffle_query_candidates: bool = True
+
+    # --- Lexical path: among catalog lines already surfaced by query-topK ∪ neighbor
+    # indices, prefer lines with high Jaro–Winkler similarity to noisy *or* gold
+    # (cheap structural confusers like same street number / token overlap).
+    # Set to 0 to disable.
+    hard_neg_lexical_max_count: int = 5
+
+    # Shuffle the final negative list (order only affects tokenization batching / SGD noise).
+    hard_neg_shuffle_final: bool = True
 
     # Train / eval split (row-level, before expanding yes/no examples)
     train_test_split_seed: int = 42
@@ -417,6 +442,54 @@ def _encoder_shortlist_indices(
 # ---------------------------------------------------------------------------
 
 
+def jaro_winkler(a: str, b: str) -> float:
+    """Best-effort Jaro–Winkler similarity in ``[0, 1]`` for lexical hard-negative scoring."""
+    try:
+        import jellyfish
+
+        if hasattr(jellyfish, "jaro_winkler_similarity"):
+            return float(jellyfish.jaro_winkler_similarity(a, b))
+        return float(jellyfish.jaro_winkler(a, b))
+    except Exception:
+        try:
+            from rapidfuzz.distance import JaroWinkler
+
+            return float(JaroWinkler.normalized_similarity(a, b))
+        except Exception:
+            return float(a == b)
+
+
+def _hard_neg_dedup_key(s: str) -> str:
+    """Normalize surface form so we do not waste the per-row budget on duplicates."""
+    return " ".join(str(s).lower().split())
+
+
+def _hard_neg_extend_unique(
+    dest: List[str],
+    seen: set,
+    additions: Sequence[str],
+    gold_canonical: str,
+    max_len: int,
+) -> None:
+    """Append strings from ``additions`` until ``max_len``, skipping gold and duplicates."""
+    gold = str(gold_canonical)
+    for raw in additions:
+        if len(dest) >= max_len:
+            return
+        if raw is None:
+            continue
+        a = str(raw).strip()
+        if not a:
+            continue
+        if a == gold:
+            continue
+        k = _hard_neg_dedup_key(a)
+        if k in seen:
+            continue
+        seen.add(k)
+        dest.append(a)
+
+
 def build_true_to_noisy_map(
     rows: Iterable[Dict[str, Any]],
     noisy_col: str,
@@ -441,7 +514,61 @@ def build_hard_negative_map(
     catalog_embeddings: torch.Tensor,
     true_to_noisy: Dict[str, List[str]],
     cfg: PipelineConfig,
+    model: Optional[torch.nn.Module] = None,
+    tokenizer: Any = None,
+    device: Optional[torch.device] = None,
 ) -> Dict[int, Dict[str, Any]]:
+    """Build per-row ``hard_negatives`` lists used as ``text_target="no"`` ranking examples.
+
+    **Why multiple sources**
+
+    1. **Canonical neighbors (legacy)** — ``NearestNeighbors`` in cosine space on *catalog*
+       embeddings finds other product lines whose *canonical* text is close to the gold
+       line in encoder geometry. We then attach *real* malformed strings observed for
+       those neighbors in the training split. This teaches "other products that look
+       like the right catalog line in embedding space."
+
+    2. **Query-conditioned encoder hits (new)** — At inference, retrieval is
+       ``cos(enc(noisy), enc(catalog_i))``. Mining negatives from the top-``K`` catalog
+       lines for *this row's* ``noisy_input`` directly targets confounders the encoder
+       already prefers (the common case where gold is mid-shortlist but ranker picks
+       an unrelated top line).
+
+    3. **Lexical rescoring (new)** — Over the *union* of catalog indices surfaced by (1)
+       and (2), we rank by ``max(JW(noisy, line), JW(gold, line))`` and take the best
+       few not already in the list. This stays cheap (no full-catalog scan) and pulls
+       token-overlap traps (same leading number, ``UNIT``, ``FRONTAGE``, etc.) that
+       dense retrieval can miss.
+
+    4. **Canonical fallbacks (new)** — If a neighbor catalog line has no training noisies
+       in ``true_to_noisy``, we still add that neighbor's *canonical* string as a
+       negative. Eval always scores catalog strings; mixing canonical negatives reduces
+       train/eval distribution shift relative to using only other rows' malformed text.
+
+    **Fill order, deduplication, and cap**
+
+    Priority is: query-encoder catalog lines → lexical picks from the index pool →
+    neighbor noisies (and optional neighbor canonical per neighbor). Deduplication uses
+    ``_hard_neg_dedup_key`` so ``max_hard_negatives_per_row`` is not wasted on repeated
+    surface forms. Shuffles use ``random.Random(cfg.seed + …)`` for reproducible
+    diversity across neighbors and per-neighbor noisy draws.
+
+    **Disabling pieces**
+
+    Set ``hard_neg_lexical_max_count`` to ``0`` to skip lexical mining. Set
+    ``hard_neg_use_query_encoder`` to false to skip query-conditioned lines. Set
+    ``hard_neg_use_canonical_neighbors`` to false to skip the neighbor graph entirely.
+    If ``hard_neg_use_query_encoder`` is true but ``model`` / ``tokenizer`` / ``device``
+    are not passed, query-conditioned mining is skipped with a one-time warning.
+    """
+    if cfg.hard_neg_use_query_encoder and (
+        model is None or tokenizer is None or device is None
+    ):
+        logger.warning(
+            "hard_neg_use_query_encoder=True but model/tokenizer/device not passed to "
+            "build_hard_negative_map; query-conditioned negatives are disabled for this run."
+        )
+
     nn = NearestNeighbors(
         n_neighbors=max(1, min(cfg.max_neighbors, len(catalog))),
         metric="cosine",
@@ -463,16 +590,109 @@ def build_hard_negative_map(
                 "hard_negatives": [],
             }
             continue
-        true_emb = catalog_embeddings[ti : ti + 1].numpy()
-        _, neighbor_indices = nn.kneighbors(true_emb)
+
+        budget = int(cfg.max_hard_negatives_per_row)
+        row_rng = random.Random(cfg.seed + 100_003 * int(idx))
+        seen: set = set()
         hard_negatives: List[str] = []
-        for neighbor_idx in neighbor_indices[0]:
-            neighbor_product = catalog[int(neighbor_idx)]
-            if neighbor_product == true_product:
-                continue
-            neighbor_noisy = true_to_noisy.get(neighbor_product, [])
-            hard_negatives.extend(neighbor_noisy[: cfg.max_noisy_per_neighbor])
-        hard_negatives = hard_negatives[: cfg.max_hard_negatives_per_row]
+
+        true_emb = catalog_embeddings[ti : ti + 1].numpy()
+        _, neighbor_indices_arr = nn.kneighbors(true_emb)
+        neighbor_indices: List[int] = [int(j) for j in neighbor_indices_arr[0]]
+
+        pool_idx: set = set()
+        query_strings: List[str] = []
+
+        # --- (2) Query-conditioned catalog lines (eval-aligned encoder confounders)
+        if (
+            cfg.hard_neg_use_query_encoder
+            and model is not None
+            and tokenizer is not None
+            and device is not None
+        ):
+            q = mean_pool_encoder(
+                model,
+                tokenizer,
+                [noisy_input],
+                batch_size=1,
+                device=device,
+            )
+            q_idxs = _encoder_shortlist_indices(
+                q,
+                catalog_embeddings,
+                int(cfg.hard_neg_query_encoder_topk),
+            )
+            for j in q_idxs:
+                j = int(j)
+                if j == int(ti):
+                    continue
+                pool_idx.add(j)
+                query_strings.append(catalog[j])
+            if cfg.hard_neg_shuffle_query_candidates:
+                row_rng.shuffle(query_strings)
+            q_cap = min(budget, int(cfg.hard_neg_query_max_count))
+            _hard_neg_extend_unique(
+                hard_negatives, seen, query_strings, true_product, q_cap
+            )
+
+        # --- Index pool for lexical pass: query hits ∪ canonical neighbors
+        if cfg.hard_neg_use_canonical_neighbors:
+            for j in neighbor_indices:
+                if int(j) != int(ti):
+                    pool_idx.add(int(j))
+
+        # --- (3) Lexical mining on the pool (no full-catalog JW scan)
+        lex_take = int(cfg.hard_neg_lexical_max_count)
+        if lex_take > 0 and pool_idx:
+            scored: List[Tuple[float, str]] = []
+            for j in pool_idx:
+                line = catalog[int(j)]
+                if line == true_product:
+                    continue
+                sc = max(
+                    jaro_winkler(noisy_input, line),
+                    jaro_winkler(true_product, line),
+                )
+                scored.append((sc, line))
+            scored.sort(key=lambda t: t[0], reverse=True)
+            lex_ordered = [s for _, s in scored]
+            lex_cap = min(budget, len(hard_negatives) + lex_take)
+            _hard_neg_extend_unique(
+                hard_negatives, seen, lex_ordered, true_product, lex_cap
+            )
+
+        # --- (1)(4) Neighbor noisies + optional neighbor canonical (coverage + catalog negatives)
+        if cfg.hard_neg_use_canonical_neighbors:
+            neigh_order = [int(j) for j in neighbor_indices if int(j) != int(ti)]
+            if cfg.hard_neg_shuffle_neighbors:
+                row_rng.shuffle(neigh_order)
+            for neighbor_idx in neigh_order:
+                if len(hard_negatives) >= budget:
+                    break
+                neighbor_product = catalog[int(neighbor_idx)]
+                if neighbor_product == true_product:
+                    continue
+                neighbor_noisy = list(true_to_noisy.get(neighbor_product, []))
+                if cfg.hard_neg_shuffle_noisy_per_neighbor:
+                    row_rng.shuffle(neighbor_noisy)
+                slice_noisy = neighbor_noisy[: int(cfg.max_noisy_per_neighbor)]
+                _hard_neg_extend_unique(
+                    hard_negatives, seen, slice_noisy, true_product, budget
+                )
+                if cfg.hard_neg_append_neighbor_canonical and len(hard_negatives) < budget:
+                    _hard_neg_extend_unique(
+                        hard_negatives,
+                        seen,
+                        [neighbor_product],
+                        true_product,
+                        budget,
+                    )
+
+        if cfg.hard_neg_shuffle_final and hard_negatives:
+            order = list(range(len(hard_negatives)))
+            row_rng.shuffle(order)
+            hard_negatives = [hard_negatives[i] for i in order]
+
         out[idx] = {
             noisy_col: noisy_input,
             canonical_col: true_product,
@@ -1087,22 +1307,6 @@ def top_k_accuracy_from_results(results: List[Dict[str, Any]], k: int = 3) -> fl
     return hit / len(results)
 
 
-def jaro_winkler(a: str, b: str) -> float:
-    try:
-        import jellyfish
-
-        if hasattr(jellyfish, "jaro_winkler_similarity"):
-            return float(jellyfish.jaro_winkler_similarity(a, b))
-        return float(jellyfish.jaro_winkler(a, b))
-    except Exception:
-        try:
-            from rapidfuzz.distance import JaroWinkler
-
-            return float(JaroWinkler.normalized_similarity(a, b))
-        except Exception:
-            return float(a == b)
-
-
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -1165,7 +1369,14 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
 
     true_to_noisy = build_true_to_noisy_map(train_rows, noisy_col, canonical_col, cfg)
     hn_map = build_hard_negative_map(
-        train_rows, catalog, catalog_embeddings, true_to_noisy, cfg
+        train_rows,
+        catalog,
+        catalog_embeddings,
+        true_to_noisy,
+        cfg,
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
     )
     train_rank_rows: List[Dict[str, Any]] = []
     for i, tr in enumerate(train_rows):
@@ -1269,6 +1480,16 @@ def run_pipeline(cfg: PipelineConfig) -> PipelineResult:
                     "collapse_repeated_alpha_min_run": str(
                         cfg.collapse_repeated_alpha_min_run
                     ),
+                    "hard_neg_use_canonical_neighbors": str(
+                        cfg.hard_neg_use_canonical_neighbors
+                    ),
+                    "hard_neg_append_neighbor_canonical": str(
+                        cfg.hard_neg_append_neighbor_canonical
+                    ),
+                    "hard_neg_use_query_encoder": str(cfg.hard_neg_use_query_encoder),
+                    "hard_neg_query_encoder_topk": str(cfg.hard_neg_query_encoder_topk),
+                    "hard_neg_query_max_count": str(cfg.hard_neg_query_max_count),
+                    "hard_neg_lexical_max_count": str(cfg.hard_neg_lexical_max_count),
                 }
             )
             mlflow.log_metrics(
@@ -1368,6 +1589,39 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         action="store_true",
         help="Do not strip punctuation from noisy text before ranking (default strips).",
     )
+    p.add_argument(
+        "--hard-neg-disable-query-encoder",
+        action="store_true",
+        help="Skip query-conditioned hard negatives (enc(noisy) vs catalog).",
+    )
+    p.add_argument(
+        "--hard-neg-disable-canonical-neighbors",
+        action="store_true",
+        help="Skip canonical-neighbor graph; use query + lexical only.",
+    )
+    p.add_argument(
+        "--hard-neg-no-neighbor-canonical",
+        action="store_true",
+        help="Do not append neighbor catalog lines when noisies are missing.",
+    )
+    p.add_argument(
+        "--hard-neg-query-topk",
+        type=int,
+        default=64,
+        help="Catalog lines retrieved for query-conditioned mining and lexical pool.",
+    )
+    p.add_argument(
+        "--hard-neg-query-max",
+        type=int,
+        default=8,
+        help="Max negatives from query-conditioned hits before lexical/neighbor fill.",
+    )
+    p.add_argument(
+        "--hard-neg-lexical-max",
+        type=int,
+        default=5,
+        help="Max lexical negatives from JW on pool (0 = off).",
+    )
 
     args = p.parse_args(argv)
 
@@ -1383,6 +1637,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         eval_shortlist_k=args.eval_shortlist_k,
         preprocess_noisy_remove_special_chars=not args.no_noisy_strip_special_chars,
         collapse_repeated_alpha_min_run=args.collapse_alpha_min_run,
+        hard_neg_use_query_encoder=not args.hard_neg_disable_query_encoder,
+        hard_neg_use_canonical_neighbors=not args.hard_neg_disable_canonical_neighbors,
+        hard_neg_append_neighbor_canonical=not args.hard_neg_no_neighbor_canonical,
+        hard_neg_query_encoder_topk=args.hard_neg_query_topk,
+        hard_neg_query_max_count=args.hard_neg_query_max,
+        hard_neg_lexical_max_count=args.hard_neg_lexical_max,
     )
     if args.parquet:
         cfg.source_table = None
