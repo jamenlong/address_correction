@@ -41,6 +41,143 @@ get_jw_score_udf = udf(get_jw_score, FloatType())
 
 # COMMAND ----------
 
+# Analysis without re-running slow test-set generation (~55 min):
+#   analysis_mode = reload_saved  → load model_output.<run_name>_output (or parquet backup)
+#   analysis_mode = run_full_prediction → run the generation loop below, then save
+dbutils.widgets.dropdown(
+    "analysis_mode",
+    "reload_saved",
+    ["reload_saved", "run_full_prediction"],
+    "reload_saved skips model.generate on the full test set",
+)
+dbutils.widgets.text(
+    "analysis_run_name",
+    "",
+    "Run name suffix only, e.g. t5_product_corrector_training_03DEC2025_05_20_02 (empty + reload uses last saved run)",
+)
+
+# COMMAND ----------
+
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
+
+# DBFS folder for parquet backups and last-run pointer (survives notebook restarts)
+EVAL_ARTIFACT_DIR = "/dbfs/FileStore/address_correction_eval"
+
+
+def _eval_artifact_path(run_name: str) -> str:
+    return f"{EVAL_ARTIFACT_DIR}/{run_name}_test_predictions.parquet"
+
+
+def _last_run_name_path() -> str:
+    return f"{EVAL_ARTIFACT_DIR}/last_run_name.txt"
+
+
+def save_last_run_name(run_name: str) -> None:
+    import os
+
+    os.makedirs(EVAL_ARTIFACT_DIR, exist_ok=True)
+    with open(_last_run_name_path(), "w", encoding="utf-8") as f:
+        f.write(run_name)
+
+
+def resolve_analysis_run_name(explicit: str = "") -> str:
+    """Pick run_name for reload: widget → last saved pointer → error."""
+    explicit = (explicit or "").strip()
+    if explicit:
+        return explicit
+    try:
+        with open(_last_run_name_path(), encoding="utf-8") as f:
+            last = f.read().strip()
+    except OSError:
+        last = ""
+    if last:
+        print(f"Using last saved run_name from {_last_run_name_path()}: {last}")
+        return last
+    raise ValueError(
+        "Set the analysis_run_name widget to your run_name "
+        "(e.g. t5_product_corrector_training_03DEC2025_05_20_02), or run a full "
+        "prediction pass once so last_run_name.txt is written."
+    )
+
+
+def add_jw_improvement_columns(sdf: DataFrame) -> DataFrame:
+    """Add jw_input, jw_output, jw_delta, jw_relative_gain, jw_improved (and jw_score alias)."""
+    if "jw_output" not in sdf.columns and "jw_score" in sdf.columns:
+        sdf = sdf.withColumn("jw_output", F.col("jw_score"))
+    if "jw_input" not in sdf.columns:
+        sdf = sdf.withColumn(
+            "jw_input",
+            get_jw_score_udf(sdf.malformed_first_line, sdf.first_line),
+        )
+    if "jw_output" not in sdf.columns:
+        sdf = sdf.withColumn(
+            "jw_output",
+            get_jw_score_udf(sdf.first_line, sdf.predicted),
+        )
+    sdf = sdf.withColumn("jw_score", F.col("jw_output"))
+    if "jw_delta" not in sdf.columns:
+        sdf = sdf.withColumn("jw_delta", F.col("jw_output") - F.col("jw_input"))
+    if "jw_relative_gain" not in sdf.columns:
+        sdf = sdf.withColumn(
+            "jw_relative_gain",
+            F.when(
+                F.col("jw_input") < F.lit(1.0),
+                (F.col("jw_output") - F.col("jw_input"))
+                / (F.lit(1.0) - F.col("jw_input")),
+            ),
+        )
+    if "jw_improved" not in sdf.columns:
+        sdf = sdf.withColumn("jw_improved", F.col("jw_delta") > F.lit(0.0))
+    return sdf
+
+
+def load_saved_predictions(run_name: str) -> DataFrame:
+    """Load predictions from Delta; fall back to parquet under EVAL_ARTIFACT_DIR."""
+    table = f"model_output.{run_name}_output"
+    try:
+        sdf = spark.table(table)
+        print(f"Loaded {sdf.count()} rows from {table}")
+        return sdf
+    except Exception as e:
+        print(f"Could not read Delta table {table} ({e}); trying parquet backup.")
+    pq = _eval_artifact_path(run_name)
+    try:
+        sdf = spark.read.parquet(pq)
+        print(f"Loaded {sdf.count()} rows from {pq}")
+        return sdf
+    except Exception as e2:
+        raise RuntimeError(
+            f"No saved predictions for run_name={run_name!r}. "
+            f"Expected Delta table {table} or parquet {pq}."
+        ) from e2
+
+
+def publish_predictions_with_jw_metrics(
+    sdf: DataFrame,
+    run_name: str,
+    *,
+    write_delta: bool = True,
+    write_parquet: bool = True,
+) -> DataFrame:
+    """Ensure JW columns exist, register temp view, optionally persist."""
+    sdf = add_jw_improvement_columns(sdf)
+    sdf.createOrReplaceTempView("test_predictions")
+    table = f"model_output.{run_name}_output"
+    if write_delta:
+        sdf.write.mode("overwrite").saveAsTable(table)
+        print(f"Updated Delta table {table}")
+    if write_parquet:
+        import os
+
+        os.makedirs(EVAL_ARTIFACT_DIR, exist_ok=True)
+        sdf.toPandas().to_parquet(_eval_artifact_path(run_name), index=False)
+        print(f"Wrote parquet backup to {_eval_artifact_path(run_name)}")
+    save_last_run_name(run_name)
+    return sdf
+
+# COMMAND ----------
+
 test_sdf = spark.sql("""
 SELECT *
 FROM smarty.smarty_malformed_1000_training
@@ -237,7 +374,8 @@ mlflow.set_experiment("/Users/jamenlong@yahoo.com/t5_experiments")
 from datetime import datetime
 ts = get_timestamp()
 run_name = f"t5_product_corrector_training_{ts}"
-print (f"Run name: {run_name}")
+print(f"Run name: {run_name}")
+save_last_run_name(run_name)
 
 # Add notes/tags for each run
 dataset_version = "v0.1"
@@ -340,119 +478,117 @@ except Exception as e:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ###Review test dataset
+# MAGIC ### Review test dataset (slow path) OR reload saved predictions (fast path)
+# MAGIC - **run_full_prediction**: runs `model.generate` on every test row (~55 min), then saves.
+# MAGIC - **reload_saved**: skips generation; loads `model_output.<run_name>_output` (or parquet backup). Set **analysis_run_name** widget, or leave empty to use the last saved run.
 
 # COMMAND ----------
 
-# Review test dataset
-import torch
 import pandas as pd
+import torch
 from tqdm import tqdm
 
-# Choose device automatically
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ANALYSIS_MODE = dbutils.widgets.get("analysis_mode").strip()
+SKIP_SLOW_PREDICTION = ANALYSIS_MODE == "reload_saved"
 
-# Move model to device
-model.to(device)
+if SKIP_SLOW_PREDICTION:
+    run_name = resolve_analysis_run_name(dbutils.widgets.get("analysis_run_name"))
+    print(f"reload_saved: skipping model.generate; run_name={run_name!r}")
+    test_pdf_predictions_sdf = publish_predictions_with_jw_metrics(
+        load_saved_predictions(run_name),
+        run_name,
+        write_delta=True,
+        write_parquet=True,
+    )
+    display(test_pdf_predictions_sdf.limit(20))
+else:
+    # --- Slow path: generate predictions on the full test split ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
 
-# Create empty DataFrame for evaluation
-model_evaluated_test_pdf = pd.DataFrame(columns = ["malformed_first_line", "predicted", "reference"])
+    model_evaluated_test_pdf = pd.DataFrame(
+        columns=["malformed_first_line", "predicted", "reference"]
+    )
+    eval_samples = dataset["test"]
+    predictions = []
+    references = []
 
-# Select a few examples from the validation set
-# eval_samples = dataset["test"].select(range(1000))
-eval_samples = dataset["test"]
+    for example in tqdm(eval_samples):
+        input_text = example["malformed_first_line"]
+        ref_text = example["first_line"]
+        input_ids = tokenizer.encode(
+            input_text, return_tensors="pt", truncation=True, max_length=32
+        ).to(device)
+        output_ids = model.generate(
+            input_ids,
+            max_length=32,
+            prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+        )
+        pred_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        predictions.append(pred_text)
+        references.append(ref_text)
 
-# Generate predictions
-predictions = []
-references = []
+    for malformed, pred, ref in zip(
+        eval_samples["malformed_first_line"], predictions, references
+    ):
+        model_evaluated_test_pdf.loc[len(model_evaluated_test_pdf)] = [
+            malformed,
+            pred,
+            ref,
+        ]
 
-for example in tqdm(eval_samples):
-    input_text = example["malformed_first_line"]
-    ref_text = example["first_line"]
-
-    input_ids = tokenizer.encode(input_text, return_tensors="pt", truncation=True, max_length=32)
-    input_ids = input_ids.to(device)
-    
-    output_ids = model.generate(input_ids, max_length=32, prefix_allowed_tokens_fn=prefix_allowed_tokens_fn)
-
-    pred_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-
-    predictions.append(pred_text)
-    references.append(ref_text)
-
-# Print side-by-side comparison
-for malformed, pred, ref in zip(eval_samples["malformed_first_line"], predictions, references):
-    # print(f"Malformed:  {malformed}")
-    # print(f"Predicted:  {pred}")
-    # print(f"Reference:  {ref}")
-    # print("-" * 50)
-    model_evaluated_test_pdf.loc[len(model_evaluated_test_pdf)] = [malformed, pred, ref]
-
-model_evaluated_test_pdf
+    display(model_evaluated_test_pdf)
 
 # COMMAND ----------
 
-# Join test dataset back to original dataset
-
-# Step 1: Convert the Hugging Face test dataset to a Pandas DataFrame
-test_pdf = dataset['test'].to_pandas()
-
-# Step 2: Join model-evaluated test dataset back to original test_pdf dataset
-test_pdf_predictions = test_pdf.merge(model_evaluated_test_pdf, on='malformed_first_line', how='left')
-
-# Step 3: Jaro–Winkler metrics — input quality, output quality, improvement, relative gain
-#   jw_input   = JW(malformed_first_line, first_line)  — how close noisy input already is
-#   jw_output  = JW(first_line, predicted)             — model output vs truth
-#   jw_delta   = jw_output - jw_input                  — signed improvement (>0 = model helped)
-#   jw_relative_gain = jw_delta / (1 - jw_input)       — share of remaining error closed (when jw_input < 1)
-#   jw_score is kept as an alias of jw_output for existing SQL below.
-from pyspark.sql import functions as F
-
-test_pdf_predictions_sdf = spark.createDataFrame(test_pdf_predictions)
-test_pdf_predictions_sdf = (
-    test_pdf_predictions_sdf.withColumn(
-        "jw_input",
-        get_jw_score_udf(
-            test_pdf_predictions_sdf.malformed_first_line,
-            test_pdf_predictions_sdf.first_line,
-        ),
+# Join + JW metrics + persist (slow path only; fast path already finished above)
+if dbutils.widgets.get("analysis_mode").strip() != "reload_saved":
+    if not globals().get("run_name"):
+        raise RuntimeError(
+            "run_name is not set. Run the training cell first, or set analysis_mode=reload_saved."
+        )
+    test_pdf = dataset["test"].to_pandas()
+    test_pdf_predictions = test_pdf.merge(
+        model_evaluated_test_pdf, on="malformed_first_line", how="left"
     )
-    .withColumn(
-        "jw_output",
-        get_jw_score_udf(
-            test_pdf_predictions_sdf.first_line,
-            test_pdf_predictions_sdf.predicted,
-        ),
+    test_pdf_predictions_sdf = spark.createDataFrame(test_pdf_predictions)
+    test_pdf_predictions_sdf = publish_predictions_with_jw_metrics(
+        test_pdf_predictions_sdf,
+        run_name,
+        write_delta=True,
+        write_parquet=True,
     )
-    .withColumn("jw_score", F.col("jw_output"))
-    .withColumn("jw_delta", F.col("jw_output") - F.col("jw_input"))
-    .withColumn(
-        "jw_relative_gain",
-        F.when(
-            F.col("jw_input") < F.lit(1.0),
-            (F.col("jw_output") - F.col("jw_input")) / (F.lit(1.0) - F.col("jw_input")),
-        ),
+    s3_path = (
+        f"s3://jml-address-validation/tables/model_output/test/{run_name}/{run_name}_output"
     )
-    .withColumn("jw_improved", F.col("jw_delta") > F.lit(0.0))
-)
-
-test_pdf_predictions_sdf.createOrReplaceTempView("test_predictions")
-
-# Save as table for later querying
-s3_path = f"s3://jml-address-validation/tables/model_output/test/{run_name}/{run_name}_output"
-test_pdf_predictions_sdf.write.mode("overwrite").saveAsTable(f"model_output.{run_name}_output")
-print(f"Table model_output.{run_name}_output saved to {s3_path}")
-
-display(test_pdf_predictions_sdf)
+    print(f"Table model_output.{run_name}_output saved to {s3_path}")
+    display(test_pdf_predictions_sdf)
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ### Improvement summary (input vs output JW)
+# MAGIC **Fast path (no ~55 min generate):** set widget `analysis_mode` = `reload_saved`, set `analysis_run_name` (or leave empty to use last run), then run the **reload** cell above and **this section only** (skip training + generate).
 # MAGIC - **jw_input**: similarity of malformed line to truth before the model.
 # MAGIC - **jw_output** / **jw_score**: similarity of prediction to truth.
 # MAGIC - **jw_delta**: `jw_output - jw_input` (positive = model moved closer to truth).
 # MAGIC - **jw_relative_gain**: `jw_delta / (1 - jw_input)` when `jw_input < 1` — fraction of *remaining* error closed (1.0 = perfect correction to JW 1).
+
+# COMMAND ----------
+
+# Resolve run_name for SQL below (safe when re-opening notebook and jumping here)
+if not globals().get("run_name"):
+    run_name = resolve_analysis_run_name(dbutils.widgets.get("analysis_run_name"))
+print(f"Analysis using run_name={run_name!r}  →  model_output.{run_name}_output")
+
+# COMMAND ----------
+
+# List saved prediction tables (pick a name for analysis_run_name widget)
+display(
+    spark.sql("SHOW TABLES IN model_output LIKE '*_output'").select(
+        "tableName"
+    )
+)
 
 # COMMAND ----------
 
