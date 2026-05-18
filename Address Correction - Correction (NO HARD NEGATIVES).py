@@ -400,9 +400,41 @@ test_pdf = dataset['test'].to_pandas()
 # Step 2: Join model-evaluated test dataset back to original test_pdf dataset
 test_pdf_predictions = test_pdf.merge(model_evaluated_test_pdf, on='malformed_first_line', how='left')
 
-# Step 3: Add JW scores for evaluation
+# Step 3: Jaro–Winkler metrics — input quality, output quality, improvement, relative gain
+#   jw_input   = JW(malformed_first_line, first_line)  — how close noisy input already is
+#   jw_output  = JW(first_line, predicted)             — model output vs truth
+#   jw_delta   = jw_output - jw_input                  — signed improvement (>0 = model helped)
+#   jw_relative_gain = jw_delta / (1 - jw_input)       — share of remaining error closed (when jw_input < 1)
+#   jw_score is kept as an alias of jw_output for existing SQL below.
+from pyspark.sql import functions as F
+
 test_pdf_predictions_sdf = spark.createDataFrame(test_pdf_predictions)
-test_pdf_predictions_sdf = test_pdf_predictions_sdf.withColumn("jw_score", get_jw_score_udf(test_pdf_predictions_sdf.first_line, test_pdf_predictions_sdf.predicted))
+test_pdf_predictions_sdf = (
+    test_pdf_predictions_sdf.withColumn(
+        "jw_input",
+        get_jw_score_udf(
+            test_pdf_predictions_sdf.malformed_first_line,
+            test_pdf_predictions_sdf.first_line,
+        ),
+    )
+    .withColumn(
+        "jw_output",
+        get_jw_score_udf(
+            test_pdf_predictions_sdf.first_line,
+            test_pdf_predictions_sdf.predicted,
+        ),
+    )
+    .withColumn("jw_score", F.col("jw_output"))
+    .withColumn("jw_delta", F.col("jw_output") - F.col("jw_input"))
+    .withColumn(
+        "jw_relative_gain",
+        F.when(
+            F.col("jw_input") < F.lit(1.0),
+            (F.col("jw_output") - F.col("jw_input")) / (F.lit(1.0) - F.col("jw_input")),
+        ),
+    )
+    .withColumn("jw_improved", F.col("jw_delta") > F.lit(0.0))
+)
 
 test_pdf_predictions_sdf.createOrReplaceTempView("test_predictions")
 
@@ -412,6 +444,58 @@ test_pdf_predictions_sdf.write.mode("overwrite").saveAsTable(f"model_output.{run
 print(f"Table model_output.{run_name}_output saved to {s3_path}")
 
 display(test_pdf_predictions_sdf)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Improvement summary (input vs output JW)
+# MAGIC - **jw_input**: similarity of malformed line to truth before the model.
+# MAGIC - **jw_output** / **jw_score**: similarity of prediction to truth.
+# MAGIC - **jw_delta**: `jw_output - jw_input` (positive = model moved closer to truth).
+# MAGIC - **jw_relative_gain**: `jw_delta / (1 - jw_input)` when `jw_input < 1` — fraction of *remaining* error closed (1.0 = perfect correction to JW 1).
+
+# COMMAND ----------
+
+# Overall improvement stats (non-trivial rows; exclude UDF error sentinel 9.9999)
+jw_summary_sdf = spark.sql(f"""
+SELECT COUNT(*) AS n_rows
+     , ROUND(AVG(jw_input), 4) AS avg_jw_input
+     , ROUND(AVG(jw_output), 4) AS avg_jw_output
+     , ROUND(AVG(jw_delta), 4) AS avg_jw_delta
+     , ROUND(AVG(jw_relative_gain), 4) AS avg_relative_gain
+     , ROUND(100.0 * SUM(CASE WHEN jw_improved THEN 1 ELSE 0 END) / COUNT(*), 2) AS pct_improved
+     , ROUND(100.0 * SUM(CASE WHEN jw_delta < 0 THEN 1 ELSE 0 END) / COUNT(*), 2) AS pct_harmed
+     , ROUND(100.0 * SUM(CASE WHEN jw_output = 1 THEN 1 ELSE 0 END) / COUNT(*), 2) AS pct_output_jw_exact
+     , ROUND(100.0 * SUM(CASE WHEN jw_input = 1 THEN 1 ELSE 0 END) / COUNT(*), 2) AS pct_input_already_exact
+FROM model_output.{run_name}_output
+WHERE predicted IS NOT NULL
+  AND malformed_first_line != first_line
+  AND jw_input <= 1
+  AND jw_output <= 1
+""")
+
+display(jw_summary_sdf)
+
+# Relative gain by malform step (same filters)
+jw_gain_by_step_sdf = spark.sql(f"""
+SELECT malformed_first_line_malform_steps
+     , COUNT(*) AS record_count
+     , ROUND(AVG(jw_input), 4) AS avg_jw_input
+     , ROUND(AVG(jw_output), 4) AS avg_jw_output
+     , ROUND(AVG(jw_delta), 4) AS avg_jw_delta
+     , ROUND(AVG(jw_relative_gain), 4) AS avg_relative_gain
+     , ROUND(100.0 * SUM(CASE WHEN jw_improved THEN 1 ELSE 0 END) / COUNT(*), 2) AS pct_improved
+     , ROUND(100.0 * SUM(CASE WHEN jw_output = 1 THEN 1 ELSE 0 END) / COUNT(*), 2) AS perc_correct
+FROM model_output.{run_name}_output
+WHERE predicted IS NOT NULL
+  AND malformed_first_line != first_line
+  AND jw_input <= 1
+  AND jw_output <= 1
+GROUP BY 1
+ORDER BY avg_jw_delta DESC
+""")
+
+display(jw_gain_by_step_sdf)
 
 # COMMAND ----------
 
@@ -437,13 +521,18 @@ run_id
 
 distr_sdf = spark.sql(f"""
 SELECT malformed_first_line_malform_steps
-     , AVG(jw_score) AS avg_jw
+     , ROUND(AVG(jw_input), 4) AS avg_jw_input
+     , ROUND(AVG(jw_output), 4) AS avg_jw_output
+     , ROUND(AVG(jw_delta), 4) AS avg_jw_delta
+     , ROUND(AVG(jw_relative_gain), 4) AS avg_relative_gain
      , COUNT(*) AS record_count
 FROM model_output.{run_name}_output
-WHERE jw_score <= 1
+WHERE jw_input <= 1
+  AND jw_output <= 1
   AND malformed_first_line != first_line
 GROUP BY 1
-ORDER BY 2 DESC""")
+ORDER BY avg_jw_output DESC
+""")
 
 display(distr_sdf)
 
@@ -453,14 +542,27 @@ display(distr_sdf)
 #  Which malform patterns are the hardest for the model to predict?
 
 malform_pattern_dist = spark.sql(f"""
-SELECT *
+SELECT malformed_first_line_malform_steps
+     , correct
+     , total_count
      , ROUND(correct / total_count, 2) AS perc_correct
-FROM (     
+     , ROUND(avg_jw_input, 4) AS avg_jw_input
+     , ROUND(avg_jw_output, 4) AS avg_jw_output
+     , ROUND(avg_jw_delta, 4) AS avg_jw_delta
+     , ROUND(avg_relative_gain, 4) AS avg_relative_gain
+FROM (
         SELECT malformed_first_line_malform_steps
-            , SUM(CASE WHEN jw_score =  1 THEN 1 ELSE 0 END) AS correct
+            , SUM(CASE WHEN jw_output = 1 THEN 1 ELSE 0 END) AS correct
             , COUNT(*) AS total_count
+            , AVG(jw_input) AS avg_jw_input
+            , AVG(jw_output) AS avg_jw_output
+            , AVG(jw_delta) AS avg_jw_delta
+            , AVG(jw_relative_gain) AS avg_relative_gain
         FROM model_output.{run_name}_output
         WHERE predicted IS NOT NULL
+          AND malformed_first_line != first_line
+          AND jw_input <= 1
+          AND jw_output <= 1
         GROUP BY 1)
         """)
 
@@ -471,15 +573,20 @@ display(malform_pattern_dist)
 # Examples of difficult malform patterns
 
 examples_sdf = spark.sql(f"""
-SELECT first_line 
+SELECT first_line
      , malformed_first_line
      , malformed_first_line_malform_steps
      , predicted
      , reference
-     , jw_score
+     , ROUND(jw_input, 4) AS jw_input
+     , ROUND(jw_output, 4) AS jw_output
+     , ROUND(jw_delta, 4) AS jw_delta
+     , ROUND(jw_relative_gain, 4) AS jw_relative_gain
+     , jw_improved
 FROM model_output.{run_name}_output
 WHERE malformed_first_line_malform_steps = ', add_special_characters'
-ORDER BY jw_score
+  AND malformed_first_line != first_line
+ORDER BY jw_delta
 """)
 
 display(examples_sdf)
