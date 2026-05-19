@@ -447,6 +447,10 @@ def get_timestamp():
 
 # COMMAND ----------
 
+!pip install mlflow
+
+# COMMAND ----------
+
 from transformers import T5ForConditionalGeneration, TrainingArguments, Trainer, pipeline
 import mlflow
 import mlflow.transformers
@@ -479,8 +483,12 @@ trainer = Trainer(
     tokenizer=tokenizer,
 )
 
+# Set your experiment (see notes from above)
+experiment_name = "/Users/jamenlong@yahoo.com/t5_experiments"
+
 # Set MLFlow experiment
-mlflow.set_experiment("/Users/jamenlong@yahoo.com/t5_experiments")
+mlflow.set_experiment(experiment_name)
+
 
 # Add identifying information to each run so they can be distinguished
 from datetime import datetime
@@ -542,7 +550,25 @@ print(f"✅ Training complete and model logged to MLflow successfully. Run name:
 
 # COMMAND ----------
 
+import mlflow
 
+# See above for inputs
+experiment = mlflow.get_experiment_by_name(experiment_name)
+
+# Get latest run
+runs = mlflow.search_runs(
+    experiment_ids=[experiment.experiment_id],
+    order_by=["start_time DESC"],
+    max_results=1
+)
+
+latest_run = runs.iloc[0]
+
+run_id = latest_run["run_id"]
+run_name = latest_run["tags.mlflow.runName"]
+
+print("Run ID:", run_id)
+print("Run Name:", run_name)
 
 # COMMAND ----------
 
@@ -598,6 +624,7 @@ except Exception as e:
 # MAGIC - **reload_saved**: skips generation; loads `model_output.<run_name>_output` (or parquet backup). Set **analysis_run_name** widget, or leave empty to use the last saved run.
 
 # COMMAND ----------
+
 
 import pandas as pd
 import torch
