@@ -453,12 +453,23 @@ import mlflow.transformers
 
 model = T5ForConditionalGeneration.from_pretrained("t5-small")
 
+import os
 import transformers
+
 print("TrainingArguments location:", TrainingArguments.__module__)
 print("Transformers version:", transformers.__version__)
 
+# HF Trainer checkpoints are large (~hundreds of MB per epoch). Writing under the
+# Repo folder blows past Databricks Repos' ~1 GB Git working-tree limit and breaks
+# git pull/push. Use DBFS instead (same idea as artifact_dir in Run_Databricks_Ranking).
+HF_TRAINER_ROOT = "/dbfs/FileStore/address_correction_training"
+os.makedirs(HF_TRAINER_ROOT, exist_ok=True)
+_hf_output_dir = os.path.join(HF_TRAINER_ROOT, "product_corrector")
+_hf_logging_dir = os.path.join(HF_TRAINER_ROOT, "logs")
+print(f"Trainer output_dir: {_hf_output_dir}")
+
 training_args = TrainingArguments(
-    output_dir="./product_corrector",
+    output_dir=_hf_output_dir,
     evaluation_strategy="epoch",
     save_strategy="epoch",
     per_device_train_batch_size=16,
@@ -467,8 +478,8 @@ training_args = TrainingArguments(
     num_train_epochs=5,
     learning_rate=5e-5,
     weight_decay=0.01,
-    logging_dir="./logs",
-    fp16=True
+    logging_dir=_hf_logging_dir,
+    fp16=True,
 )
 
 trainer = Trainer(

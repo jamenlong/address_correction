@@ -37,9 +37,11 @@ model.safetensors
 # Logs / local training dirs (HF Trainer default; keep off Repo disk in Databricks)
 logs/
 runs/
+product_corrector/
 product_corrector*/
 product_corrector_hard_negs/
 **/checkpoint-*/
+**/product_corrector/**
 
 # Env / secrets
 .env
