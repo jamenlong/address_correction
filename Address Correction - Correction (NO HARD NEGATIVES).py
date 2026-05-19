@@ -53,7 +53,12 @@ dbutils.widgets.dropdown(
 dbutils.widgets.text(
     "analysis_run_name",
     "",
-    "Run name suffix only, e.g. t5_product_corrector_training_03DEC2025_05_20_02 (empty + reload uses last saved run)",
+    "Run name only, e.g. t5_product_corrector_training_03DEC2025_05_20_02 (empty = last run that finished saving predictions)",
+)
+dbutils.widgets.text(
+    "analysis_predictions_table",
+    "",
+    "Optional full table name if not model_output.<run_name>_output (e.g. hive_metastore.model_output.my_output)",
 )
 
 # COMMAND ----------
@@ -63,10 +68,17 @@ from pyspark.sql import functions as F
 
 # DBFS folder for parquet backups and last-run pointer (survives notebook restarts)
 EVAL_ARTIFACT_DIR = "/dbfs/FileStore/address_correction_eval"
+EVAL_ARTIFACT_DBFS = "dbfs:/FileStore/address_correction_eval"
 
 
-def _eval_artifact_path(run_name: str) -> str:
+def _eval_artifact_path_local(run_name: str) -> str:
+    """Driver/local path (open(), pandas)."""
     return f"{EVAL_ARTIFACT_DIR}/{run_name}_test_predictions.parquet"
+
+
+def _eval_artifact_path_spark(run_name: str) -> str:
+    """Spark read/write path on Databricks."""
+    return f"{EVAL_ARTIFACT_DBFS}/{run_name}_test_predictions.parquet"
 
 
 def _last_run_name_path() -> str:
@@ -82,7 +94,7 @@ def save_last_run_name(run_name: str) -> None:
 
 
 def resolve_analysis_run_name(explicit: str = "") -> str:
-    """Pick run_name for reload: widget → last saved pointer → error."""
+    """Pick run_name for reload: widget → last *saved predictions* pointer → error."""
     explicit = (explicit or "").strip()
     if explicit:
         return explicit
@@ -92,13 +104,86 @@ def resolve_analysis_run_name(explicit: str = "") -> str:
     except OSError:
         last = ""
     if last:
-        print(f"Using last saved run_name from {_last_run_name_path()}: {last}")
+        print(f"Using last saved predictions run_name from {_last_run_name_path()}: {last}")
         return last
     raise ValueError(
-        "Set the analysis_run_name widget to your run_name "
-        "(e.g. t5_product_corrector_training_03DEC2025_05_20_02), or run a full "
-        "prediction pass once so last_run_name.txt is written."
+        "Set the analysis_run_name widget to a run whose predictions were saved "
+        "(see SHOW TABLES IN model_output LIKE '*_output'), or run once with "
+        "analysis_mode=run_full_prediction through the save cell."
     )
+
+
+def list_saved_prediction_tables() -> List[str]:
+    """Return fully qualified table names under schema model_output ending in _output."""
+    names: List[str] = []
+    try:
+        rows = spark.sql("SHOW TABLES IN model_output LIKE '*_output'").collect()
+    except Exception:
+        try:
+            spark.sql("CREATE DATABASE IF NOT EXISTS model_output")
+            rows = spark.sql("SHOW TABLES IN model_output LIKE '*_output'").collect()
+        except Exception:
+            return names
+    for row in rows:
+        t = getattr(row, "tableName", None) or row["tableName"]
+        names.append(f"model_output.{t}")
+    return sorted(names)
+
+
+def _try_load_table(table_name: str) -> Optional[DataFrame]:
+    try:
+        sdf = spark.table(table_name)
+        _ = sdf.limit(1).count()
+        return sdf
+    except Exception:
+        return None
+
+
+def _try_load_parquet(path: str) -> Optional[DataFrame]:
+    try:
+        sdf = spark.read.parquet(path)
+        _ = sdf.limit(1).count()
+        return sdf
+    except Exception:
+        return None
+
+
+def find_prediction_sources(run_name: str, table_override: str = "") -> List[Tuple[str, str]]:
+    """Return [(kind, location), ...] for existing artifacts, best match first."""
+    found: List[Tuple[str, str]] = []
+    override = (table_override or "").strip()
+    if override:
+        if _try_load_table(override) is not None:
+            found.append(("delta", override))
+
+    seen = {loc for _, loc in found}
+    primary = f"model_output.{run_name}_output"
+    for tbl in [primary, f"hive_metastore.{primary}"]:
+        if tbl not in seen and _try_load_table(tbl) is not None:
+            found.append(("delta", tbl))
+            seen.add(tbl)
+
+    for tbl in list_saved_prediction_tables():
+        if tbl not in seen and run_name in tbl.split(".")[-1]:
+            if _try_load_table(tbl) is not None:
+                found.append(("delta", tbl))
+                seen.add(tbl)
+
+    for pq in (_eval_artifact_path_spark(run_name), _eval_artifact_path_local(run_name)):
+        if pq not in seen and _try_load_parquet(pq) is not None:
+            found.append(("parquet", pq))
+            seen.add(pq)
+
+    # Same session: generate finished but publish/save cell not run yet
+    if "test_predictions" not in seen:
+        try:
+            sdf = spark.table("test_predictions")
+            if "predicted" in sdf.columns:
+                found.append(("temp_view", "test_predictions"))
+        except Exception:
+            pass
+
+    return found
 
 
 def add_jw_improvement_columns(sdf: DataFrame) -> DataFrame:
@@ -132,25 +217,51 @@ def add_jw_improvement_columns(sdf: DataFrame) -> DataFrame:
     return sdf
 
 
-def load_saved_predictions(run_name: str) -> DataFrame:
-    """Load predictions from Delta; fall back to parquet under EVAL_ARTIFACT_DIR."""
-    table = f"model_output.{run_name}_output"
-    try:
-        sdf = spark.table(table)
-        print(f"Loaded {sdf.count()} rows from {table}")
-        return sdf
-    except Exception as e:
-        print(f"Could not read Delta table {table} ({e}); trying parquet backup.")
-    pq = _eval_artifact_path(run_name)
-    try:
-        sdf = spark.read.parquet(pq)
-        print(f"Loaded {sdf.count()} rows from {pq}")
-        return sdf
-    except Exception as e2:
-        raise RuntimeError(
-            f"No saved predictions for run_name={run_name!r}. "
-            f"Expected Delta table {table} or parquet {pq}."
-        ) from e2
+def load_saved_predictions(
+    run_name: str,
+    table_override: str = "",
+) -> DataFrame:
+    """Load predictions from Delta, parquet, or temp view; print hints if missing."""
+    sources = find_prediction_sources(run_name, table_override=table_override)
+    if not sources:
+        available = list_saved_prediction_tables()
+        msg = [
+            f"No saved predictions for run_name={run_name!r}.",
+            "",
+            "Common causes:",
+            "  • Training set last_run_name.txt but the slow prediction + SAVE cell never ran.",
+            "  • Cluster/metastore changed (table exists in another workspace).",
+            "",
+            "Fix: set analysis_mode=run_full_prediction and run through the cell that",
+            "writes model_output.<run_name>_output (or set analysis_predictions_table).",
+            "",
+            f"Expected Delta: model_output.{run_name}_output",
+            f"Expected parquet: {_eval_artifact_path_spark(run_name)}",
+        ]
+        if available:
+            msg.append("")
+            msg.append("Tables found in model_output:")
+            for t in available[-20:]:
+                msg.append(f"  • {t}")
+            msg.append(
+                "Copy the matching run into the analysis_run_name widget "
+                "(the part before _output)."
+            )
+        else:
+            msg.append("")
+            msg.append("No model_output.*_output tables found in this metastore.")
+        raise RuntimeError("\n".join(msg))
+
+    kind, loc = sources[0]
+    if len(sources) > 1:
+        print("Also found:", ", ".join(f"{k}={v}" for k, v in sources[1:]))
+    if kind == "delta" or kind == "temp_view":
+        sdf = spark.table(loc)
+    else:
+        sdf = spark.read.parquet(loc)
+    n = sdf.count()
+    print(f"Loaded {n} rows from {kind} ({loc})")
+    return sdf
 
 
 def publish_predictions_with_jw_metrics(
@@ -171,8 +282,9 @@ def publish_predictions_with_jw_metrics(
         import os
 
         os.makedirs(EVAL_ARTIFACT_DIR, exist_ok=True)
-        sdf.toPandas().to_parquet(_eval_artifact_path(run_name), index=False)
-        print(f"Wrote parquet backup to {_eval_artifact_path(run_name)}")
+        pq_spark = _eval_artifact_path_spark(run_name)
+        sdf.write.mode("overwrite").parquet(pq_spark)
+        print(f"Wrote parquet backup to {pq_spark}")
     save_last_run_name(run_name)
     return sdf
 
@@ -375,7 +487,10 @@ from datetime import datetime
 ts = get_timestamp()
 run_name = f"t5_product_corrector_training_{ts}"
 print(f"Run name: {run_name}")
-save_last_run_name(run_name)
+print(
+    "Note: predictions are saved under this run_name only after the slow "
+    "prediction + publish cell (not at training time)."
+)
 
 # Add notes/tags for each run
 dataset_version = "v0.1"
@@ -493,9 +608,17 @@ SKIP_SLOW_PREDICTION = ANALYSIS_MODE == "reload_saved"
 
 if SKIP_SLOW_PREDICTION:
     run_name = resolve_analysis_run_name(dbutils.widgets.get("analysis_run_name"))
+    table_override = dbutils.widgets.get("analysis_predictions_table").strip()
     print(f"reload_saved: skipping model.generate; run_name={run_name!r}")
+    sources = find_prediction_sources(run_name, table_override=table_override)
+    if sources:
+        print("Found:", ", ".join(f"{k}={v}" for k, v in sources))
+    else:
+        print("No artifacts yet for this run_name. Available tables:")
+        for t in list_saved_prediction_tables()[-15:]:
+            print(f"  {t}")
     test_pdf_predictions_sdf = publish_predictions_with_jw_metrics(
-        load_saved_predictions(run_name),
+        load_saved_predictions(run_name, table_override=table_override),
         run_name,
         write_delta=True,
         write_parquet=True,
