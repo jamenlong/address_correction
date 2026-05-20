@@ -453,6 +453,7 @@ def get_timestamp():
 
 # COMMAND ----------
 
+# Takes ~ 1 hour
 from transformers import T5ForConditionalGeneration, TrainingArguments, Trainer, pipeline
 import mlflow
 import mlflow.transformers
