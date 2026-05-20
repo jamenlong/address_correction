@@ -63,6 +63,8 @@ dbutils.widgets.text(
 
 # COMMAND ----------
 
+from typing import List, Optional, Tuple
+
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
@@ -630,12 +632,37 @@ except Exception as e:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Review test dataset (slow path) OR reload saved predictions (fast path)
-# MAGIC - **run_full_prediction**: runs `model.generate` on every test row (~55 min), then saves.
-# MAGIC - **reload_saved**: skips generation; loads `model_output.<run_name>_output` (or parquet backup). Set **analysis_run_name** widget, or leave empty to use the last saved run.
+# MAGIC ### Cell 21 — Test-set predictions OR reload saved results
+# MAGIC
+# MAGIC **What this cell does**
+# MAGIC - Branches on the **`analysis_mode`** widget (set near the top of the notebook).
+# MAGIC - **`run_full_prediction` (slow, ~55 min):** Loops over every row in `dataset["test"]`, runs
+# MAGIC   `model.generate` with **`prefix_allowed_tokens_fn`** so each prediction is constrained to a
+# MAGIC   valid catalog `first_line`, and builds `model_evaluated_test_pdf`. Does **not** write Delta yet —
+# MAGIC   run the **next cell** to join, compute JW metrics, and save.
+# MAGIC - **`reload_saved` (fast):** Skips `model.generate`. Loads a prior run from
+# MAGIC   `model_output.<run_name>_output` or `dbfs:/FileStore/address_correction_eval/...parquet`,
+# MAGIC   adds JW columns if missing, and refreshes the table. Use this when you return later for analysis only.
+# MAGIC
+# MAGIC **Why two paths**
+# MAGIC - Generation is expensive; JW/improvement analysis should not require re-running it.
+# MAGIC - Reload only works after a successful slow path + save cell has created artifacts for that `run_name`.
+# MAGIC
+# MAGIC **Widgets**
+# MAGIC - `analysis_run_name` — run suffix (e.g. `t5_product_corrector_training_18MAY2026_18_56_21`), or empty to use
+# MAGIC   the last run that **finished saving** predictions (`last_run_name.txt` on DBFS).
+# MAGIC - `analysis_predictions_table` — optional full table name override if your table is not under `model_output.*`.
+# MAGIC
+# MAGIC **Prerequisites**
+# MAGIC - Slow path: training cell completed (`model`, `tokenizer`, `dataset`, `prefix_allowed_tokens_fn`, `run_name`).
+# MAGIC - Reload path: jellyfish UDF + helper cells only; **do not** need `model` loaded.
+# MAGIC
+# MAGIC **Fresh full notebook run:** set `analysis_mode` = **`run_full_prediction`**, then run this cell and the **next** cell.
 
 # COMMAND ----------
 
+# Cell 21 — see markdown above. Slow path: constrained generate on test split.
+# Fast path: load_saved_predictions → publish_predictions_with_jw_metrics (JW + Delta + parquet).
 
 import pandas as pd
 import torch
