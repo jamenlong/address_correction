@@ -22,6 +22,10 @@
 # MAGIC Read **`pct_exact_gain`**, **`fixed_t5_miss`**, **`broke_t5_hit`** in the summary tables. Inspect **wins** / **regressions** cells at the bottom.
 # MAGIC
 # MAGIC T5 baseline table is **read-only**. Results go to `model_output.<run>_recovery_eval` (or `output_table` if set).
+# MAGIC
+# MAGIC **Run order:** widgets → repo path → `%pip` + `%restart_python` → repo path again →
+# MAGIC `%run CharacterReplacementDictionary` → benchmark cells. After restart, always re-run
+# MAGIC from the **repo path** cell through the end (not only cell 9).
 
 # COMMAND ----------
 
@@ -91,16 +95,40 @@ for p in candidates:
 
 # COMMAND ----------
 
-# MAGIC %run ./CharacterReplacementDictionary
-
-# COMMAND ----------
-
-# Optional: speeds up catalog JW matching (~2-5x). Safe to skip if already installed.
+# Optional: speeds up catalog JW matching (~2-5x). Run once per cluster, then restart Python.
 %pip install -q rapidfuzz
 
 # COMMAND ----------
 
 # MAGIC %restart_python
+
+# COMMAND ----------
+
+# Re-run after restart: repo path + malform dictionary (restart clears all variables).
+import os
+import sys
+
+notebook_path = (
+    dbutils.notebook.entry_point.getDbutils()
+    .notebook()
+    .getContext()
+    .notebookPath()
+    .get()
+)
+for p in (
+    "/Workspace" + notebook_path.rsplit("/", 1)[0]
+    if notebook_path.startswith(("/Users/", "/Repos/"))
+    else os.path.dirname(notebook_path),
+    os.getcwd(),
+):
+    if p and os.path.isdir(p) and p not in sys.path:
+        sys.path.insert(0, p)
+        os.chdir(p)
+        break
+
+# COMMAND ----------
+
+# MAGIC %run ./CharacterReplacementDictionary
 
 # COMMAND ----------
 
