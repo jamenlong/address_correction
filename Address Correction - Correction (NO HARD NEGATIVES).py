@@ -4,12 +4,14 @@
 
 # COMMAND ----------
 
+# AO
 # %pip install transformers==4.29.2 datasets accelerate sentencepiece
 %pip install jellyfish
 dbutils.library.restartPython()
 
 # COMMAND ----------
 
+# AO
 from pyspark.sql.functions import udf
 from pyspark.sql.types import DoubleType, StringType, FloatType
 import jellyfish
@@ -41,6 +43,7 @@ get_jw_score_udf = udf(get_jw_score, FloatType())
 
 # COMMAND ----------
 
+# AO
 # Analysis without re-running slow test-set generation (~55 min):
 #   analysis_mode = reload_saved  → load model_output.<run_name>_output (or parquet backup)
 #   analysis_mode = run_full_prediction → run the generation loop below, then save
@@ -61,8 +64,10 @@ dbutils.widgets.text(
     "Optional full table name if not model_output.<run_name>_output (e.g. hive_metastore.model_output.my_output)",
 )
 
+
 # COMMAND ----------
 
+# AO
 from typing import List, Optional, Tuple
 
 from pyspark.sql import DataFrame
@@ -288,7 +293,7 @@ def publish_predictions_with_jw_metrics(
         sdf.write.mode("overwrite").parquet(pq_spark)
         print(f"Wrote parquet backup to {pq_spark}")
     save_last_run_name(run_name)
-    return sdf
+    return sdf 
 
 # COMMAND ----------
 
@@ -730,6 +735,7 @@ else:
 
 # COMMAND ----------
 
+# AO
 # Join + JW metrics + persist (slow path only; fast path already finished above)
 if dbutils.widgets.get("analysis_mode").strip() != "reload_saved":
     if not globals().get("run_name"):
@@ -772,6 +778,7 @@ print(f"Analysis using run_name={run_name!r}  →  model_output.{run_name}_outpu
 
 # COMMAND ----------
 
+# AO
 # List saved prediction tables (pick a name for analysis_run_name widget)
 display(
     spark.sql("SHOW TABLES IN model_output LIKE '*_output'").select(
@@ -824,6 +831,13 @@ display(jw_gain_by_step_sdf)
 
 # COMMAND ----------
 
+# MAGIC %sql
+# MAGIC
+# MAGIC SELECT *
+# MAGIC FROM model_output.t5_product_corrector_training_20may2026_16_07_06_output
+
+# COMMAND ----------
+
 sdf = spark.sql("""
 SELECT first_line
      , COUNT(*) As record_count
@@ -833,10 +847,12 @@ ORDER BY 1
                 """)
 
 display(sdf) 
+# AO
 
 # COMMAND ----------
 
 run_id
+# AO
 
 # COMMAND ----------
 
