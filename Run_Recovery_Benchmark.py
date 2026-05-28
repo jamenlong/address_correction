@@ -95,6 +95,11 @@ for p in candidates:
 
 # COMMAND ----------
 
+# Optional: speeds up catalog JW matching (~2-5x). Safe to skip if already installed.
+# MAGIC %pip install -q rapidfuzz
+
+# COMMAND ----------
+
 from address_malform_recovery import RecoveryConfig
 from address_recovery_benchmark import (
     BenchmarkTableConfig,

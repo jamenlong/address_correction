@@ -14,11 +14,12 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from address_malform_recovery import (
+    CatalogIndex,
     RecoveryConfig,
+    apply_hybrid_override,
+    build_inverse_char_map,
     jaro_winkler,
-    maybe_override_prediction,
     normalize_address,
-    parse_malform_steps,
     recover_address,
 )
 
@@ -101,6 +102,9 @@ def enrich_row_with_recovery(
     char_malform_dct: Dict[str, Sequence[str]],
     recovery_config: Optional[RecoveryConfig] = None,
     bench: Optional[BenchmarkTableConfig] = None,
+    *,
+    catalog_index: Optional[CatalogIndex] = None,
+    inverse_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     Add recovery / hybrid JW metrics on top of baseline T5 columns in ``row``.
@@ -127,16 +131,10 @@ def enrich_row_with_recovery(
         char_malform_dct,
         malform_steps=steps,
         config=rcfg,
+        catalog_index=catalog_index,
+        inverse_map=inverse_map,
     )
-    hybrid_pred, _ = maybe_override_prediction(
-        malformed,
-        t5_pred,
-        truth,
-        catalog,
-        char_malform_dct,
-        malform_steps=steps,
-        config=rcfg,
-    )
+    hybrid_pred = apply_hybrid_override(t5_pred, truth, rec, rcfg)
 
     rec_match = rec.catalog_match or ""
     jw_rec_only = (
@@ -346,10 +344,19 @@ def run_recovery_benchmark_pandas(
     char_malform_dct: Dict[str, Sequence[str]],
     recovery_config: Optional[RecoveryConfig] = None,
     bench: Optional[BenchmarkTableConfig] = None,
-    progress_every: int = 500,
+    progress_every: int = 50,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Enrich baseline rows and return (enriched_rows, aggregate_report)."""
+    import time
+
+    n_rows = len(baseline_rows)
+    print(f"  building catalog index ({len(catalog)} lines)...")
+    catalog_index = CatalogIndex.build(catalog)
+    print(f"  building inverse char map...")
+    inverse_map = build_inverse_char_map(char_malform_dct)
+
     enriched: List[Dict[str, Any]] = []
+    t0 = time.time()
     for i, row in enumerate(baseline_rows):
         enriched.append(
             enrich_row_with_recovery(
@@ -358,10 +365,18 @@ def run_recovery_benchmark_pandas(
                 char_malform_dct,
                 recovery_config=recovery_config,
                 bench=bench,
+                catalog_index=catalog_index,
+                inverse_map=inverse_map,
             )
         )
         if progress_every and (i + 1) % progress_every == 0:
-            print(f"  enriched {i + 1}/{len(baseline_rows)} rows")
+            elapsed = time.time() - t0
+            rate = (i + 1) / elapsed if elapsed > 0 else 0.0
+            eta = (n_rows - i - 1) / rate if rate > 0 else 0.0
+            print(
+                f"  enriched {i + 1}/{n_rows} rows "
+                f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)"
+            )
     report = aggregate_benchmark_rows(enriched)
     return enriched, report
 

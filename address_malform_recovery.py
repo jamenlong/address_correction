@@ -90,6 +90,59 @@ class RecoveryResult:
     debug: Optional[str] = None
 
 
+@dataclass
+class CatalogIndex:
+    """Pre-normalized catalog for fast JW lookup (build once per benchmark run)."""
+
+    entries: List[Tuple[str, str]]  # (normalized, raw)
+
+    @classmethod
+    def build(cls, catalog: Sequence[str]) -> "CatalogIndex":
+        entries: List[Tuple[str, str]] = []
+        seen: Set[str] = set()
+        for raw in catalog:
+            if not raw:
+                continue
+            norm = normalize_address(raw)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            entries.append((norm, str(raw)))
+        return cls(entries=entries)
+
+    def best_match(self, query: str) -> Tuple[Optional[str], float]:
+        q = normalize_address(query)
+        if not q or not self.entries:
+            return None, 0.0
+        try:
+            from rapidfuzz import process
+            from rapidfuzz.distance import JaroWinkler
+
+            norms = [e[0] for e in self.entries]
+            hit = process.extractOne(
+                q,
+                norms,
+                scorer=JaroWinkler.normalized_similarity,
+            )
+            if hit is not None:
+                _, score, idx = hit
+                return self.entries[idx][1], float(score)
+        except Exception:
+            pass
+        best_jw = 0.0
+        best_raw: Optional[str] = None
+        for norm_c, raw in self.entries:
+            if norm_c == q:
+                return raw, 1.0
+            jw = jaro_winkler(q, norm_c)
+            if jw > best_jw:
+                best_jw = jw
+                best_raw = raw
+                if best_jw >= 1.0:
+                    break
+        return best_raw, best_jw
+
+
 def build_inverse_char_map(
     char_malform_dct: Dict[str, Sequence[str]],
 ) -> Dict[str, str]:
@@ -258,16 +311,11 @@ def best_catalog_match(
     query: str,
     catalog: Sequence[str],
     top_k: int = 15,
+    catalog_index: Optional[CatalogIndex] = None,
 ) -> Tuple[Optional[str], float]:
-    q = normalize_address(query)
-    if not q or not catalog:
-        return None, 0.0
-    scored = [(normalize_address(c), c, jaro_winkler(q, normalize_address(c))) for c in catalog]
-    scored.sort(key=lambda x: x[2], reverse=True)
-    if not scored:
-        return None, 0.0
-    _, raw, score = scored[0]
-    return raw, score
+    if catalog_index is not None:
+        return catalog_index.best_match(query)
+    return CatalogIndex.build(catalog).best_match(query)
 
 
 def recover_address(
@@ -276,6 +324,9 @@ def recover_address(
     char_malform_dct: Dict[str, Sequence[str]],
     malform_steps: Optional[str] = None,
     config: Optional[RecoveryConfig] = None,
+    *,
+    catalog_index: Optional[CatalogIndex] = None,
+    inverse_map: Optional[Dict[str, str]] = None,
 ) -> RecoveryResult:
     """
     Undo enabled malform steps, then pick best catalog line by JW on normalized text.
@@ -294,13 +345,16 @@ def recover_address(
             debug="steps_not_enabled_or_empty",
         )
 
-    inverse = build_inverse_char_map(char_malform_dct)
+    index = catalog_index or CatalogIndex.build(catalog)
+    inv = inverse_map if inverse_map is not None else build_inverse_char_map(
+        char_malform_dct
+    )
     candidates: List[str] = [malformed or ""]
 
     if MALFORM_STEP_REPLACE_CHAR in enabled and MALFORM_STEP_REPLACE_CHAR in steps:
         candidates = undo_replace_char_beam(
             malformed or "",
-            inverse,
+            inv,
             max_beam_positions=cfg.max_beam_positions,
             beam_width=cfg.beam_width,
         )
@@ -309,8 +363,7 @@ def recover_address(
     best_match: Optional[str] = None
     best_jw = 0.0
     for cand in candidates:
-        norm_cand = normalize_address(cand)
-        match, jw = best_catalog_match(norm_cand, catalog, top_k=cfg.catalog_top_k)
+        match, jw = index.best_match(cand)
         if jw > best_jw:
             best_jw = jw
             best_match = match
@@ -326,6 +379,26 @@ def recover_address(
     )
 
 
+def apply_hybrid_override(
+    t5_prediction: str,
+    true_line: Optional[str],
+    rec: RecoveryResult,
+    config: Optional[RecoveryConfig] = None,
+) -> str:
+    """Pick T5 or recovery catalog line using JW margin vs truth (or T5 if no truth)."""
+    cfg = config or RecoveryConfig()
+    if not rec.used_recovery or not rec.catalog_match:
+        return t5_prediction
+
+    ref = true_line if true_line else t5_prediction
+    norm_ref = normalize_address(ref)
+    jw_rec = jaro_winkler(normalize_address(rec.catalog_match), norm_ref)
+    jw_t5 = jaro_winkler(normalize_address(t5_prediction or ""), norm_ref)
+    if jw_rec >= jw_t5 + cfg.min_jw_margin_over_t5:
+        return rec.catalog_match
+    return t5_prediction
+
+
 def maybe_override_prediction(
     malformed: str,
     t5_prediction: str,
@@ -334,32 +407,28 @@ def maybe_override_prediction(
     char_malform_dct: Dict[str, Sequence[str]],
     malform_steps: Optional[str] = None,
     config: Optional[RecoveryConfig] = None,
+    *,
+    catalog_index: Optional[CatalogIndex] = None,
+    inverse_map: Optional[Dict[str, str]] = None,
+    rec: Optional[RecoveryResult] = None,
 ) -> Tuple[str, RecoveryResult]:
     """
     Return recovery catalog match if it beats T5 by JW margin (when true_line given,
     comparison is to true_line; otherwise to T5 prediction only).
     """
     cfg = config or RecoveryConfig()
-    rec = recover_address(
-        malformed,
-        catalog,
-        char_malform_dct,
-        malform_steps=malform_steps,
-        config=cfg,
-    )
-    if not rec.used_recovery or not rec.catalog_match:
-        return t5_prediction, rec
-
-    ref = true_line if true_line else t5_prediction
-    jw_rec = jaro_winkler(
-        normalize_address(rec.catalog_match), normalize_address(ref)
-    )
-    jw_t5 = jaro_winkler(
-        normalize_address(t5_prediction or ""), normalize_address(ref)
-    )
-    if jw_rec >= jw_t5 + cfg.min_jw_margin_over_t5:
-        return rec.catalog_match, rec
-    return t5_prediction, rec
+    if rec is None:
+        rec = recover_address(
+            malformed,
+            catalog,
+            char_malform_dct,
+            malform_steps=malform_steps,
+            config=cfg,
+            catalog_index=catalog_index,
+            inverse_map=inverse_map,
+        )
+    hybrid = apply_hybrid_override(t5_prediction, true_line, rec, cfg)
+    return hybrid, rec
 
 
 def summarize_recovery_eval(
