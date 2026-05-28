@@ -96,7 +96,11 @@ for p in candidates:
 # COMMAND ----------
 
 # Optional: speeds up catalog JW matching (~2-5x). Safe to skip if already installed.
-# MAGIC %pip install -q rapidfuzz
+%pip install -q rapidfuzz
+
+# COMMAND ----------
+
+# MAGIC %restart_python
 
 # COMMAND ----------
 
