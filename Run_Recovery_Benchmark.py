@@ -210,3 +210,18 @@ display(spark.sql(queries["by_malform_step"]))
 
 display(spark.sql(queries["wins"]))
 display(spark.sql(queries["regressions"]))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Outcome breakdown & still-unfixed rows
+# MAGIC
+# MAGIC - **outcome_breakdown**: already correct under T5, fixed by recovery, regressions, still wrong
+# MAGIC - **still_unfixed**: rows where `hybrid_exact` is false (detail, worst JW first)
+# MAGIC - **still_unfixed_breakdown**: why unfixed rows stayed wrong (`recovery_used`, `prediction_source`)
+
+# COMMAND ----------
+
+display(spark.sql(queries["outcome_breakdown"]))
+display(spark.sql(queries["still_unfixed"]))
+display(spark.sql(queries["still_unfixed_breakdown"]))

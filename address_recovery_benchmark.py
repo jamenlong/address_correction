@@ -330,11 +330,60 @@ ORDER BY jw_delta_vs_t5 DESC
 LIMIT 200
 """
 
+    outcome_breakdown = f"""
+SELECT
+  CASE
+    WHEN t5_exact AND hybrid_exact THEN 'already_ok_t5'
+    WHEN NOT t5_exact AND hybrid_exact THEN 'fixed_by_recovery'
+    WHEN t5_exact AND NOT hybrid_exact THEN 'regression'
+    WHEN NOT t5_exact AND NOT hybrid_exact THEN 'still_wrong'
+  END AS outcome,
+  COUNT(*) AS n
+FROM {eval_table}
+WHERE 1=1{step_filter}
+GROUP BY 1
+ORDER BY 1
+"""
+
+    still_unfixed = f"""
+SELECT
+  malformed_first_line,
+  first_line,
+  predicted AS t5_predicted,
+  hybrid_predicted,
+  recovery_catalog_match,
+  recovery_used,
+  prediction_source,
+  benchmark_jw_input,
+  benchmark_jw_output_t5,
+  jw_output_hybrid,
+  jw_delta_vs_t5,
+  recovery_recovered_text,
+  malformed_first_line_malform_steps
+FROM {eval_table}
+WHERE NOT hybrid_exact{step_filter}
+ORDER BY jw_output_hybrid ASC
+"""
+
+    still_unfixed_breakdown = f"""
+SELECT
+  recovery_used,
+  prediction_source,
+  COUNT(*) AS n
+FROM {eval_table}
+WHERE NOT hybrid_exact{step_filter}
+GROUP BY 1, 2
+ORDER BY n DESC
+"""
+
     return {
         "overall": overall,
         "by_malform_step": by_step,
         "wins": wins,
         "regressions": regressions,
+        "outcome_breakdown": outcome_breakdown,
+        "still_unfixed": still_unfixed,
+        "still_unfixed_breakdown": still_unfixed_breakdown,
     }
 
 

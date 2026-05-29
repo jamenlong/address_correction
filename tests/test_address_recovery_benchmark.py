@@ -71,6 +71,18 @@ class TestRecoveryBenchmark(unittest.TestCase):
         self.assertIn("20may2026", cfg.baseline_table)
         self.assertTrue(cfg.output_table().endswith("_recovery_eval"))
 
+    def test_benchmark_summary_sql_includes_unfixed_queries(self):
+        from address_recovery_benchmark import benchmark_summary_sql
+
+        q = benchmark_summary_sql("model_output.test_recovery_eval")
+        for key in (
+            "outcome_breakdown",
+            "still_unfixed",
+            "still_unfixed_breakdown",
+        ):
+            self.assertIn(key, q)
+            self.assertIn("model_output.test_recovery_eval", q[key])
+
 
 if __name__ == "__main__":
     unittest.main()
