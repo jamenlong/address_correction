@@ -3,7 +3,8 @@ import unittest
 from address_malform_recovery import (
     MALFORM_STEP_REPLACE_CHAR,
     RecoveryConfig,
-    build_inverse_char_map,
+    build_inverse_char_map_multi,
+    is_allowed_address_text,
     normalize_address,
     parse_malform_steps,
     recover_address,
@@ -38,7 +39,7 @@ class TestAddressMalformRecovery(unittest.TestCase):
         )
 
     def test_undo_replace_char_greedy(self):
-        inv = build_inverse_char_map(MINI_CHAR_MALFORM_DCT)
+        inv = build_inverse_char_map_multi(MINI_CHAR_MALFORM_DCT)
         self.assertEqual(undo_replace_char_greedy("4o85", inv), "4085")
         self.assertEqual(undo_replace_char_greedy("B0", inv), "80")
 
@@ -48,7 +49,7 @@ class TestAddressMalformRecovery(unittest.TestCase):
 
     def test_beam_no_ambiguity_returns_greedy(self):
         """When nothing is ambiguous the beam should match greedy."""
-        inv = build_inverse_char_map(MINI_CHAR_MALFORM_DCT)
+        inv = build_inverse_char_map_multi(MINI_CHAR_MALFORM_DCT)
         # "4o85" has only one canonical for 'o' -> '0'
         beam = undo_replace_char_beam("4o85", inv)
         self.assertIn("4085", beam)
@@ -63,7 +64,7 @@ class TestAddressMalformRecovery(unittest.TestCase):
         For an address like 'FOO ST' where original could be 'F00 ST' or 'FOO ST',
         the beam should generate both variants so catalog scoring can pick.
         """
-        inv = build_inverse_char_map(ZERO_O_DCT)
+        inv = build_inverse_char_map_multi(ZERO_O_DCT)
         # Malformed: 'o' at position 1 could be digit 0 or letter O
         candidates = undo_replace_char_beam("Foo", inv, max_beam_positions=6, beam_width=32)
         normalized = [normalize_address(c) for c in candidates]
@@ -81,7 +82,7 @@ class TestAddressMalformRecovery(unittest.TestCase):
 
     def test_beam_width_caps_candidates(self):
         """beam_width must hard-cap the number of returned strings."""
-        inv = build_inverse_char_map(ZERO_O_DCT)
+        inv = build_inverse_char_map_multi(ZERO_O_DCT)
         # 10 characters all ambiguous -> would be huge without cap
         text = "o" * 10
         candidates = undo_replace_char_beam(text, inv, max_beam_positions=10, beam_width=8)
@@ -89,7 +90,7 @@ class TestAddressMalformRecovery(unittest.TestCase):
 
     def test_beam_max_positions_limits_branching(self):
         """max_beam_positions=1 should only branch on the first ambiguous spot."""
-        inv = build_inverse_char_map(ZERO_O_DCT)
+        inv = build_inverse_char_map_multi(ZERO_O_DCT)
         # Three ambiguous positions
         text = "ooo"
         # With max_beam_positions=1 only the first 'o' branches
@@ -166,6 +167,29 @@ class TestAddressMalformRecovery(unittest.TestCase):
         )
         self.assertFalse(res_off.used_recovery)
         self.assertEqual(res_off.applied_steps, ())
+
+    def test_allowed_address_charset(self):
+        self.assertTrue(is_allowed_address_text("4085 MAIN ST APT 103"))
+        self.assertTrue(is_allowed_address_text("123-45 N. AVE, STE 2"))
+        self.assertFalse(is_allowed_address_text("4085\u0305 MAIN"))
+
+    def test_strict_charset_blocks_recovery(self):
+        catalog = ["4085 MAIN ST"]
+        cfg = RecoveryConfig(
+            enabled_steps=frozenset({MALFORM_STEP_REPLACE_CHAR}),
+            min_jw_to_accept=0.5,
+            strict_replace_char_undo=True,
+        )
+        res = recover_address(
+            "4085\u0305 MAIN ST",
+            catalog,
+            MINI_CHAR_MALFORM_DCT,
+            malform_steps=", replace_char",
+            config=cfg,
+        )
+        self.assertFalse(res.used_recovery)
+        self.assertFalse(res.charset_clean)
+        self.assertEqual(res.debug, "charset_not_clean")
 
     def test_incremental_config_only_replace_char(self):
         catalog = ["4085 MAIN ST APT 103"]

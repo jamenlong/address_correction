@@ -41,7 +41,7 @@ Compare **malform recovery + hybrid override** to a saved T5 eval table without 
 
 | Module | Role |
 |--------|------|
-| `address_malform_recovery.py` | Undo malform steps (start with `replace_char`), catalog JW match |
+| `address_malform_recovery.py` | Undo malform steps (start with `replace_char`), NFKC + charset gate, catalog JW match |
 | `address_recovery_benchmark.py` | Enrich baseline `model_output.*_output` rows with hybrid metrics |
 | `Run_Recovery_Benchmark.py` | Databricks notebook: widgets, Delta output, wins/regressions |
 
@@ -51,6 +51,8 @@ Compare **malform recovery + hybrid override** to a saved T5 eval table without 
 1. Open `Run_Recovery_Benchmark.py` on a cluster.
 2. Set `run_phase` to `smoke_replace_char`, run all cells.
 3. Then `full_replace_char` for the full single-step `replace_char` slice.
+
+**Strict `replace_char` undo (default):** full dictionary longest-match tokenization, beam on all ambiguous positions, NFKC on candidates, and only catalog-match when recovered text is charset-clean (alphanumerics plus `.` `-` `,` space). Rows with leftover specials get `recovery_charset_clean = false` and `recovery_debug = charset_not_clean` (hybrid stays on T5).
 4. Use SQL summaries and the wins/regressions displays to decide whether to tune thresholds or add the next malform step.
 
 Local tests: `python3 -m unittest tests.test_address_malform_recovery tests.test_address_recovery_benchmark`

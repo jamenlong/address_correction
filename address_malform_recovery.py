@@ -21,6 +21,9 @@ MALFORM_STEP_REPLACE_CHAR = "replace_char"
 # Add future steps here as they are implemented, then enable in RecoveryConfig.
 IMPLEMENTED_STEPS: FrozenSet[str] = frozenset({MALFORM_STEP_REPLACE_CHAR})
 
+# US address lines: alphanumerics plus common punctuation (after NFKC).
+_ALLOWED_ADDRESS_TEXT_RE = re.compile(r"^[A-Za-z0-9 .,\-]*$")
+
 
 def jaro_winkler(a: str, b: str) -> float:
     try:
@@ -79,6 +82,10 @@ class RecoveryConfig:
     # Kept for backward compatibility; no longer the primary cap (beam_width is).
     max_undo_candidates: int = 64
 
+    # Strict replace_char undo: branch on all ambiguous positions, require NFKC text
+    # to contain only ALLOWED_ADDRESS_TEXT_RE characters before accepting recovery.
+    strict_replace_char_undo: bool = True
+
 
 @dataclass
 class RecoveryResult:
@@ -87,6 +94,7 @@ class RecoveryResult:
     catalog_jw: float
     applied_steps: Tuple[str, ...]
     used_recovery: bool
+    charset_clean: bool = True
     debug: Optional[str] = None
 
 
@@ -143,29 +151,49 @@ class CatalogIndex:
         return best_raw, best_jw
 
 
-def build_inverse_char_map(
-    char_malform_dct: Dict[str, Sequence[str]],
-) -> Dict[str, str]:
-    """
-    Map malformed token -> canonical character (key from char_malform_dct).
+def nfkc_recovered_text(text: str) -> str:
+    """Unicode normalize recovered undo text (before charset check / catalog JW)."""
+    if not text:
+        return ""
+    return unicodedata.normalize("NFKC", str(text))
 
-    Single-character alts also register upper/lower variants. Multi-character
-  alts (e.g. homoglyph art) are stored as full-string keys.
+
+def is_allowed_address_text(text: str) -> bool:
+    """True when text uses only alphanumerics, space, period, hyphen, comma."""
+    return bool(_ALLOWED_ADDRESS_TEXT_RE.match(nfkc_recovered_text(text)))
+
+
+def build_inverse_char_map_multi(
+    char_malform_dct: Dict[str, Sequence[str]],
+) -> Dict[str, List[str]]:
     """
-    inverse: Dict[str, str] = {}
+    Map malformed token -> list of possible canonical characters.
+
+    Every alt in ``char_malform_dct`` is registered so a full longest-match sweep
+    can revert dictionary substitutions (including multi-codepoint homoglyphs).
+    """
+    multi: Dict[str, List[str]] = {}
     for canonical, alts in char_malform_dct.items():
         if not canonical:
             continue
         canon = str(canonical)
         for alt in alts or []:
             alt_s = str(alt)
-            if not alt_s or alt_s == canon:
+            if not alt_s:
                 continue
-            inverse[alt_s] = canon
-            if len(alt_s) == 1 and alt_s.isalpha():
-                inverse[alt_s.upper()] = canon
-                inverse[alt_s.lower()] = canon
-    return inverse
+            for key in {alt_s, alt_s.upper(), alt_s.lower()} if len(alt_s) == 1 else {alt_s}:
+                opts = multi.setdefault(key, [])
+                if canon not in opts:
+                    opts.append(canon)
+    return multi
+
+
+def build_inverse_char_map(
+    char_malform_dct: Dict[str, Sequence[str]],
+) -> Dict[str, str]:
+    """Single canonical per malformed token (first listed); prefer ``_multi`` in beam."""
+    multi = build_inverse_char_map_multi(char_malform_dct)
+    return {k: v[0] for k, v in multi.items() if v}
 
 
 def _steps_allowed(steps: Sequence[str], enabled: Set[str]) -> bool:
@@ -175,7 +203,8 @@ def _steps_allowed(steps: Sequence[str], enabled: Set[str]) -> bool:
 
 
 def _tokenize_for_undo(
-    text: str, inverse_map: Dict[str, str]
+    text: str,
+    inverse_multi: Dict[str, List[str]],
 ) -> List[Tuple[int, str, List[str]]]:
     """
     Walk the malformed string once and return a list of tokens:
@@ -183,7 +212,7 @@ def _tokenize_for_undo(
 
     Strategy
     --------
-    At each position we collect *all* keys in inverse_map whose length equals
+    At each position we collect *all* keys in the inverse map whose length equals
     the longest match.  Each such key may map to a **different** canonical,
     producing a genuine alternative (ambiguous position).
 
@@ -193,7 +222,7 @@ def _tokenize_for_undo(
     what makes 0/O branching work: the malformed token 'O' maps to '0', but
     'O' unchanged is also a valid hypothesis (it really is the letter O).
     """
-    keys_by_len = sorted(inverse_map.keys(), key=len, reverse=True)
+    keys_by_len = sorted(inverse_multi.keys(), key=len, reverse=True)
     tokens: List[Tuple[int, str, List[str]]] = []
     i = 0
     n = len(text)
@@ -207,9 +236,9 @@ def _tokenize_for_undo(
                 if best_len == 0:
                     best_len = len(key)
                 if len(key) == best_len:
-                    canon = inverse_map[key]
-                    if canon not in options:
-                        options.append(canon)
+                    for canon in inverse_multi[key]:
+                        if canon not in options:
+                            options.append(canon)
         if best_len > 0:
             raw = text[i : i + best_len]
             # If the raw token is a single alphanumeric char it could also
@@ -227,17 +256,19 @@ def _tokenize_for_undo(
     return tokens
 
 
-def undo_replace_char_greedy(text: str, inverse_map: Dict[str, str]) -> str:
+def undo_replace_char_greedy(
+    text: str, inverse_multi: Dict[str, List[str]]
+) -> str:
     """Single greedy-undo pass: always pick the first canonical option."""
-    if not text or not inverse_map:
+    if not text or not inverse_multi:
         return text
-    tokens = _tokenize_for_undo(text, inverse_map)
+    tokens = _tokenize_for_undo(text, inverse_multi)
     return "".join(opts[0] for _, _, opts in tokens)
 
 
 def undo_replace_char_beam(
     text: str,
-    inverse_map: Dict[str, str],
+    inverse_multi: Dict[str, List[str]],
     max_beam_positions: int = 6,
     beam_width: int = 64,
 ) -> List[str]:
@@ -263,7 +294,7 @@ def undo_replace_char_beam(
     if not text:
         return [""]
 
-    tokens = _tokenize_for_undo(text, inverse_map)
+    tokens = _tokenize_for_undo(text, inverse_multi)
 
     # Count how many positions are genuinely ambiguous
     ambiguous_indices = [
@@ -272,10 +303,13 @@ def undo_replace_char_beam(
 
     # If nothing is ambiguous, fall straight through to greedy
     if not ambiguous_indices:
-        return ["".join(opts[0] for _, _, opts in tokens)]
+        return [nfkc_recovered_text("".join(opts[0] for _, _, opts in tokens))]
 
-    # Limit branching to the first max_beam_positions ambiguous positions
-    branch_set: Set[int] = set(ambiguous_indices[:max_beam_positions])
+    # max_beam_positions < 0 → branch on every ambiguous position (strict mode)
+    if max_beam_positions < 0:
+        branch_set: Set[int] = set(ambiguous_indices)
+    else:
+        branch_set = set(ambiguous_indices[:max_beam_positions])
 
     # Each beam state is a list of chosen canonical strings (one per token so far)
     beam: List[List[str]] = [[]]
@@ -300,11 +334,29 @@ def undo_replace_char_beam(
     seen: Set[str] = set()
     result: List[str] = []
     for state in beam:
-        s = "".join(state)
+        s = nfkc_recovered_text("".join(state))
         if s not in seen:
             seen.add(s)
             result.append(s)
     return result
+
+
+def _filter_charset_clean_candidates(
+    candidates: Sequence[str],
+    *,
+    strict: bool,
+) -> List[str]:
+    """Keep NFKC candidates that satisfy the US address character whitelist."""
+    out: List[str] = []
+    seen: Set[str] = set()
+    for cand in candidates:
+        normed = nfkc_recovered_text(cand)
+        if strict and not is_allowed_address_text(normed):
+            continue
+        if normed not in seen:
+            seen.add(normed)
+            out.append(normed)
+    return out
 
 
 def best_catalog_match(
@@ -327,6 +379,7 @@ def recover_address(
     *,
     catalog_index: Optional[CatalogIndex] = None,
     inverse_map: Optional[Dict[str, str]] = None,
+    inverse_multi: Optional[Dict[str, List[str]]] = None,
 ) -> RecoveryResult:
     """
     Undo enabled malform steps, then pick best catalog line by JW on normalized text.
@@ -346,36 +399,63 @@ def recover_address(
         )
 
     index = catalog_index or CatalogIndex.build(catalog)
-    inv = inverse_map if inverse_map is not None else build_inverse_char_map(
-        char_malform_dct
-    )
-    candidates: List[str] = [malformed or ""]
+    inv_multi = inverse_multi or build_inverse_char_map_multi(char_malform_dct)
+    if inverse_map is None:
+        inverse_map = {k: v[0] for k, v in inv_multi.items() if v}
+
+    strict = cfg.strict_replace_char_undo
+    max_pos = -1 if strict else cfg.max_beam_positions
+    candidates: List[str] = [nfkc_recovered_text(malformed or "")]
 
     if MALFORM_STEP_REPLACE_CHAR in enabled and MALFORM_STEP_REPLACE_CHAR in steps:
         candidates = undo_replace_char_beam(
             malformed or "",
-            inv,
-            max_beam_positions=cfg.max_beam_positions,
+            inv_multi,
+            max_beam_positions=max_pos,
             beam_width=cfg.beam_width,
         )
 
-    best_text = malformed or ""
+    clean_candidates = _filter_charset_clean_candidates(
+        candidates, strict=strict
+    )
+    if not clean_candidates:
+        return RecoveryResult(
+            recovered_text=nfkc_recovered_text(malformed or ""),
+            catalog_match=None,
+            catalog_jw=0.0,
+            applied_steps=tuple(s for s in steps if s in enabled),
+            used_recovery=False,
+            charset_clean=False,
+            debug="charset_not_clean",
+        )
+
+    best_text = clean_candidates[0]
     best_match: Optional[str] = None
     best_jw = 0.0
-    for cand in candidates:
+    for cand in clean_candidates:
         match, jw = index.best_match(cand)
         if jw > best_jw:
             best_jw = jw
             best_match = match
             best_text = cand
 
-    used = best_jw >= cfg.min_jw_to_accept and best_match is not None
+    charset_clean = is_allowed_address_text(best_text)
+    used = (
+        charset_clean
+        and best_jw >= cfg.min_jw_to_accept
+        and best_match is not None
+    )
+    debug = None
+    if not charset_clean:
+        debug = "charset_not_clean"
     return RecoveryResult(
         recovered_text=best_text,
         catalog_match=best_match,
         catalog_jw=best_jw,
         applied_steps=tuple(s for s in steps if s in enabled),
         used_recovery=used,
+        charset_clean=charset_clean,
+        debug=debug,
     )
 
 
@@ -410,6 +490,7 @@ def maybe_override_prediction(
     *,
     catalog_index: Optional[CatalogIndex] = None,
     inverse_map: Optional[Dict[str, str]] = None,
+    inverse_multi: Optional[Dict[str, List[str]]] = None,
     rec: Optional[RecoveryResult] = None,
 ) -> Tuple[str, RecoveryResult]:
     """
@@ -426,6 +507,7 @@ def maybe_override_prediction(
             config=cfg,
             catalog_index=catalog_index,
             inverse_map=inverse_map,
+            inverse_multi=inverse_multi,
         )
     hybrid = apply_hybrid_override(t5_prediction, true_line, rec, cfg)
     return hybrid, rec

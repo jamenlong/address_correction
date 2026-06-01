@@ -79,6 +79,7 @@ class TestRecoveryBenchmark(unittest.TestCase):
             "outcome_breakdown",
             "still_unfixed",
             "still_unfixed_breakdown",
+            "charset_not_clean",
         ):
             self.assertIn(key, q)
             self.assertIn("model_output.test_recovery_eval", q[key])

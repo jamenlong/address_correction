@@ -18,6 +18,7 @@ from address_malform_recovery import (
     RecoveryConfig,
     apply_hybrid_override,
     build_inverse_char_map,
+    build_inverse_char_map_multi,
     jaro_winkler,
     normalize_address,
     recover_address,
@@ -105,6 +106,7 @@ def enrich_row_with_recovery(
     *,
     catalog_index: Optional[CatalogIndex] = None,
     inverse_map: Optional[Dict[str, str]] = None,
+    inverse_multi: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, Any]:
     """
     Add recovery / hybrid JW metrics on top of baseline T5 columns in ``row``.
@@ -133,6 +135,7 @@ def enrich_row_with_recovery(
         config=rcfg,
         catalog_index=catalog_index,
         inverse_map=inverse_map,
+        inverse_multi=inverse_multi,
     )
     hybrid_pred = apply_hybrid_override(t5_pred, truth, rec, rcfg)
 
@@ -162,6 +165,8 @@ def enrich_row_with_recovery(
             "recovery_catalog_match": rec_match,
             "recovery_catalog_jw": rec.catalog_jw,
             "recovery_used": rec.used_recovery,
+            "recovery_charset_clean": rec.charset_clean,
+            "recovery_debug": rec.debug,
             "recovery_applied_steps": ",".join(rec.applied_steps),
             "hybrid_predicted": hybrid_pred,
             "jw_output_recovery_only": jw_rec_only,
@@ -359,10 +364,26 @@ SELECT
   jw_output_hybrid,
   jw_delta_vs_t5,
   recovery_recovered_text,
+  recovery_charset_clean,
+  recovery_debug,
   malformed_first_line_malform_steps
 FROM {eval_table}
 WHERE NOT hybrid_exact{step_filter}
 ORDER BY jw_output_hybrid ASC
+"""
+
+    charset_not_clean = f"""
+SELECT
+  malformed_first_line,
+  recovery_recovered_text,
+  recovery_catalog_match,
+  recovery_used,
+  recovery_debug,
+  malformed_first_line_malform_steps
+FROM {eval_table}
+WHERE NOT recovery_charset_clean{step_filter}
+ORDER BY malformed_first_line
+LIMIT 500
 """
 
     still_unfixed_breakdown = f"""
@@ -384,6 +405,7 @@ ORDER BY n DESC
         "outcome_breakdown": outcome_breakdown,
         "still_unfixed": still_unfixed,
         "still_unfixed_breakdown": still_unfixed_breakdown,
+        "charset_not_clean": charset_not_clean,
     }
 
 
@@ -402,6 +424,7 @@ def run_recovery_benchmark_pandas(
     print(f"  building catalog index ({len(catalog)} lines)...")
     catalog_index = CatalogIndex.build(catalog)
     print(f"  building inverse char map...")
+    inverse_multi = build_inverse_char_map_multi(char_malform_dct)
     inverse_map = build_inverse_char_map(char_malform_dct)
 
     enriched: List[Dict[str, Any]] = []
@@ -416,6 +439,7 @@ def run_recovery_benchmark_pandas(
                 bench=bench,
                 catalog_index=catalog_index,
                 inverse_map=inverse_map,
+                inverse_multi=inverse_multi,
             )
         )
         if progress_every and (i + 1) % progress_every == 0:
